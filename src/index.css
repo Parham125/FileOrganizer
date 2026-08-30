@@ -1,0 +1,98 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+  --paper: #f2f3ef;
+  --surface: #ffffff;
+  --surface-2: #eaebe5;
+  --ink: #1d2530;
+  --ink-soft: #55606d;
+  --ink-faint: #8a94a0;
+  --line: #e1e2dc;
+  --line-strong: #d2d4cc;
+  --teal: #2f6f5e;
+  --teal-soft: #e6f0eb;
+  --teal-line: #bcd8ce;
+  --ochre: #8f5f19;
+  --ochre-soft: #f4ebd6;
+  --brick: #a83c2f;
+  --brick-soft: #f6e2dd;
+}
+
+.dark {
+  color-scheme: dark;
+  --paper: #12171e;
+  --surface: #1a212a;
+  --surface-2: #232c37;
+  --ink: #e7eaed;
+  --ink-soft: #9aa5b1;
+  --ink-faint: #69737e;
+  --line: #29323c;
+  --line-strong: #35404b;
+  --teal: #57b89c;
+  --teal-soft: #16302a;
+  --teal-line: #26493f;
+  --ochre: #d3a24d;
+  --ochre-soft: #2c2515;
+  --brick: #db6f61;
+  --brick-soft: #2e1a17;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-teal: var(--teal);
+  --color-teal-soft: var(--teal-soft);
+  --color-teal-line: var(--teal-line);
+  --color-ochre: var(--ochre);
+  --color-ochre-soft: var(--ochre-soft);
+  --color-brick: var(--brick);
+  --color-brick-soft: var(--brick-soft);
+  --font-sans:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes fo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fo-spin {
+  animation: fo-spin 0.7s linear infinite;
+}
