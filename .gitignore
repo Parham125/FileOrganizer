@@ -1,0 +1,30 @@
+# Rust / Cargo
+/target
+/src-tauri/target
+
+# Node
+node_modules
+dist
+.vite
+
+# Tauri generated
+/src-tauri/gen/schemas
+
+# Env / secrets
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+# Agent worktrees / tooling
+.claude/

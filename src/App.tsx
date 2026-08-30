@@ -1,0 +1,64 @@
+import { useEffect, useState } from "react";
+import { invoke } from "./bridge";
+import { useLocalStorageState, useModel, useTheme } from "./store";
+import type { HashAlgo, ViewId } from "./types";
+import Sidebar from "./components/Sidebar";
+import SearchView from "./views/SearchView";
+import DuplicatesView from "./views/DuplicatesView";
+import OrganizeView from "./views/OrganizeView";
+import AssistantView from "./views/AssistantView";
+import TrashView from "./views/TrashView";
+import SettingsView from "./views/SettingsView";
+
+export default function App() {
+  const [view, setView] = useLocalStorageState<ViewId>("fo.view", "search");
+  const [model, setModel] = useModel();
+  const [algo, setAlgo] = useLocalStorageState<HashAlgo>("fo.algo", "blake3");
+  const [theme, setTheme, isDark] = useTheme();
+  const [indexed, setIndexed] = useState(0);
+
+  useEffect(() => {
+    invoke<number>("index_stats")
+      .then(setIndexed)
+      .catch(() => setIndexed(0));
+  }, []);
+
+  const goSettings = () => setView("settings");
+
+  return (
+    <div className="flex h-full flex-col bg-paper text-ink md:flex-row">
+      <Sidebar
+        view={view}
+        onView={setView}
+        indexed={indexed}
+        isDark={isDark}
+        onToggleTheme={() => setTheme(isDark ? "light" : "dark")}
+      />
+      <main className="min-w-0 flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-3xl px-5 py-6 md:px-8 md:py-9">
+          {view === "search" && (
+            <SearchView indexed={indexed} onIndexed={setIndexed} />
+          )}
+          {view === "duplicates" && <DuplicatesView algo={algo} />}
+          {view === "organize" && (
+            <OrganizeView model={model} onGoSettings={goSettings} />
+          )}
+          {view === "assistant" && (
+            <AssistantView model={model} onGoSettings={goSettings} />
+          )}
+          {view === "trash" && <TrashView />}
+          {view === "settings" && (
+            <SettingsView
+              model={model}
+              onModel={setModel}
+              algo={algo}
+              onAlgo={setAlgo}
+              theme={theme}
+              onTheme={setTheme}
+            />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
