@@ -1,7 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { invoke } from "../bridge";
-import type { AgentResult, ChatMessage, PendingAction } from "../types";
+import { invoke, listen } from "../bridge";
+import type {
+  AgentResult,
+  AgentStep,
+  ChatMessage,
+  PendingAction,
+} from "../types";
 import PageHeader from "../components/PageHeader";
+import Markdown from "../components/Markdown";
 import {
   IconAssistant,
   IconCheck,
@@ -9,16 +15,26 @@ import {
   IconSpark,
 } from "../components/icons";
 
-const TOOL_LABELS: Record<string, string> = {
-  search: "Searched files",
-  scan_duplicates: "Scanned for duplicates",
-  list_trash: "Checked the Trash",
-  index_stats: "Checked the index",
-  index_folder: "Indexed a folder",
-  trash_files: "Moved files to Trash",
-  reveal_file: "Revealed a file",
-  open_file: "Opened a file",
+// Two voices for the same tool: what it is doing now, and what it did.
+const TOOL_RUNNING: Record<string, string> = {
+  search_files: "Searching files",
+  list_folder: "Reading a folder",
+  find_duplicates: "Scanning for duplicates",
+  index_stats: "Checking the index",
+  trash_files: "Preparing to move files to Trash",
+  move_files: "Preparing to move files",
 };
+
+const TOOL_LABELS: Record<string, string> = {
+  search_files: "Searched files",
+  list_folder: "Read a folder",
+  find_duplicates: "Scanned for duplicates",
+  index_stats: "Checked the index",
+  trash_files: "Moved files to Trash",
+  move_files: "Moved files",
+};
+
+type LiveStep = { id: string; name: string; done: boolean };
 
 const EXAMPLES = [
   "Find duplicate photos in Downloads",
@@ -41,10 +57,20 @@ function actionPaths(p: PendingAction): string[] {
   return [];
 }
 
-function ActivityNote({ label }: { label: string }) {
+function ActivityNote({ label, live }: { label: string; live?: boolean }) {
   return (
-    <div className="flex items-center gap-2 px-1 text-xs text-ink-faint">
-      <span className="h-1 w-1 rounded-full bg-ink-faint" />
+    <div
+      className={
+        "flex items-center gap-2 px-1 text-xs " +
+        (live ? "text-ink-soft" : "text-ink-faint")
+      }
+    >
+      <span
+        className={
+          "h-1.5 w-1.5 shrink-0 " +
+          (live ? "bg-teal fo-pulse" : "border border-ink-faint bg-transparent")
+        }
+      />
       {label}
     </div>
   );
@@ -65,17 +91,72 @@ export default function AssistantView({
   const [input, setInput] = useState("");
   const [error, setError] = useState("");
   const [needsKey, setNeedsKey] = useState(false);
+  const [stream, setStream] = useState("");
+  const [steps, setSteps] = useState<LiveStep[]>([]);
+  const [awaiting, setAwaiting] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // Only a turn we started listens to the event stream, and autoscroll lets go
+  // the moment the reader scrolls up to read something further back.
+  const liveRef = useRef(false);
+  const stickRef = useRef(true);
+  const lastTopRef = useRef(0);
 
   const hasChat = messages.some(
     (m) => (m.role === "user" || m.role === "assistant") && m.content,
   );
 
   useEffect(() => {
+    let dropped = false;
+    const offs: (() => void)[] = [];
+    const keep = (p: Promise<() => void>) =>
+      void p.then((off) => (dropped ? off() : offs.push(off)));
+    keep(
+      listen<string>("ai:delta", (frag) => {
+        if (liveRef.current) setStream((s) => s + frag);
+      }),
+    );
+    keep(
+      listen<AgentStep>("ai:step", (step) => {
+        if (!liveRef.current) return;
+        if (step.kind === "tool" && step.name) {
+          const name = step.name;
+          setSteps((prev) => [
+            ...prev,
+            { id: `${name}-${prev.length}`, name, done: false },
+          ]);
+        } else if (step.kind === "tool_done" && step.name) {
+          const name = step.name;
+          setSteps((prev) => {
+            const i = prev.findIndex((s) => s.name === name && !s.done);
+            if (i < 0) return prev;
+            const next = [...prev];
+            next[i] = { ...next[i], done: true };
+            return next;
+          });
+        } else if (step.kind === "awaiting_approval") {
+          setAwaiting(true);
+        }
+      }),
+    );
+    keep(
+      listen("ai:done", () => {
+        if (liveRef.current)
+          setSteps((prev) => prev.map((s) => ({ ...s, done: true })));
+      }),
+    );
+    return () => {
+      dropped = true;
+      offs.forEach((off) => off());
+    };
+  }, []);
+
+  useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, pending, thinking]);
+    if (!el || !stickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+    lastTopRef.current = el.scrollTop;
+  }, [messages, pending, thinking, stream, steps, awaiting]);
 
   useLayoutEffect(() => {
     const ta = taRef.current;
@@ -84,24 +165,50 @@ export default function AssistantView({
     ta.style.height = Math.min(ta.scrollHeight, 128) + "px";
   }, [input]);
 
+  // Every turn starts from an empty buffer, and the resolved transcript replaces
+  // the streamed copy in the same commit, so the reply never renders twice.
+  function startTurn() {
+    setStream("");
+    setSteps([]);
+    setAwaiting(false);
+    setThinking(true);
+    setError("");
+    setPending([]);
+    stickRef.current = true;
+    liveRef.current = true;
+  }
+
+  function endTurn(r: AgentResult) {
+    liveRef.current = false;
+    setStream("");
+    setSteps([]);
+    setAwaiting(false);
+    setMessages(r.messages);
+    setPending(r.pending);
+    setDone(r.done);
+    setApprovals(Object.fromEntries(r.pending.map((p) => [p.id, true])));
+  }
+
   async function send(text: string) {
     const content = text.trim();
     if (!content || thinking) return;
     const next: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(next);
     setInput("");
-    setThinking(true);
-    setError("");
     setNeedsKey(false);
-    setPending([]);
+    startTurn();
     try {
-      const r = await invoke<AgentResult>("ai_agent", { messages: next, model });
-      setMessages(r.messages);
-      setPending(r.pending);
-      setDone(r.done);
-      setApprovals(Object.fromEntries(r.pending.map((p) => [p.id, true])));
+      const r = await invoke<AgentResult>("ai_agent", {
+        messages: next,
+        model,
+      });
+      endTurn(r);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      liveRef.current = false;
+      setStream("");
+      setSteps([]);
+      setAwaiting(false);
       setNeedsKey(/no api key/i.test(msg));
       setError(msg);
     } finally {
@@ -115,20 +222,19 @@ export default function AssistantView({
       id: p.id,
       approved: approvals[p.id] !== false,
     }));
-    setThinking(true);
-    setError("");
-    setPending([]);
+    startTurn();
     try {
       const r = await invoke<AgentResult>("ai_agent_continue", {
         messages,
         approvals: decisions,
         model,
       });
-      setMessages(r.messages);
-      setPending(r.pending);
-      setDone(r.done);
-      setApprovals(Object.fromEntries(r.pending.map((p) => [p.id, true])));
+      endTurn(r);
     } catch (e) {
+      liveRef.current = false;
+      setStream("");
+      setSteps([]);
+      setAwaiting(false);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setThinking(false);
@@ -143,6 +249,9 @@ export default function AssistantView({
     setError("");
     setNeedsKey(false);
     setInput("");
+    setStream("");
+    setSteps([]);
+    setAwaiting(false);
   }
 
   const approvedCount = pending.filter((p) => approvals[p.id] !== false).length;
@@ -166,7 +275,19 @@ export default function AssistantView({
       />
 
       <div className="flex h-[64vh] min-h-[440px] flex-col overflow-hidden rounded-lg border border-line bg-surface">
-        <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            // Only a scroll upward hands control back to the reader: growing
+            // text alone must not look like they scrolled away.
+            const el = e.currentTarget;
+            if (el.scrollTop < lastTopRef.current - 4) stickRef.current = false;
+            else if (el.scrollHeight - el.scrollTop - el.clientHeight < 48)
+              stickRef.current = true;
+            lastTopRef.current = el.scrollTop;
+          }}
+          className="flex-1 space-y-4 overflow-y-auto px-4 py-5"
+        >
           {!hasChat && !thinking ? (
             <div className="flex h-full flex-col items-center justify-center px-4 text-center">
               <IconAssistant className="mb-3 h-8 w-8 text-ink-faint" />
@@ -174,8 +295,8 @@ export default function AssistantView({
                 What do you want to sort out?
               </p>
               <p className="mt-1 max-w-sm text-sm text-ink-soft">
-                Try one of these, or type your own. Nothing is deleted without your
-                go-ahead.
+                Try one of these, or type your own. Nothing is deleted without
+                your go-ahead.
               </p>
               <div className="mt-4 flex flex-col items-stretch gap-2 sm:flex-row sm:justify-center">
                 {EXAMPLES.map((ex) => (
@@ -215,8 +336,8 @@ export default function AssistantView({
                 if (m.role === "assistant" && m.content)
                   return (
                     <div key={i} className="flex justify-start">
-                      <div className="max-w-[85%] whitespace-pre-wrap rounded-lg rounded-bl-sm border border-line bg-surface-2 px-3.5 py-2.5 text-sm text-ink">
-                        {m.content}
+                      <div className="min-w-0 max-w-[92%] rounded-lg rounded-bl-sm border border-line bg-surface-2 px-3.5 py-2.5 sm:max-w-[85%]">
+                        <Markdown text={m.content} />
                       </div>
                     </div>
                   );
@@ -224,9 +345,36 @@ export default function AssistantView({
               })}
 
               {thinking && (
-                <div className="flex items-center gap-2 px-1 text-sm text-ink-soft">
-                  <span className="h-3.5 w-3.5 rounded-full border-2 border-teal/30 border-t-teal fo-spin" />
-                  Thinking
+                <div className="space-y-2">
+                  {steps.map((s) => (
+                    <ActivityNote
+                      key={s.id}
+                      live={!s.done}
+                      label={
+                        s.done
+                          ? (TOOL_LABELS[s.name] ?? "Used a tool")
+                          : (TOOL_RUNNING[s.name] ?? "Working")
+                      }
+                    />
+                  ))}
+                  {awaiting && (
+                    <ActivityNote live label="Waiting on your go-ahead" />
+                  )}
+                  {stream ? (
+                    <div className="flex justify-start">
+                      <div className="fo-streaming min-w-0 max-w-[92%] rounded-lg rounded-bl-sm border border-line bg-surface-2 px-3.5 py-2.5 sm:max-w-[85%]">
+                        <Markdown text={stream} />
+                      </div>
+                    </div>
+                  ) : (
+                    steps.every((s) => s.done) &&
+                    !awaiting && (
+                      <div className="flex items-center gap-2 px-1 text-sm text-ink-soft">
+                        <span className="h-3.5 w-3.5 rounded-full border-2 border-teal/30 border-t-teal fo-spin" />
+                        Thinking
+                      </div>
+                    )
+                  )}
                 </div>
               )}
 

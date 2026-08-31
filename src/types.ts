@@ -115,6 +115,13 @@ export type PendingAction = {
   args: Record<string, unknown>;
 };
 
+// Live turn events: "ai:delta" carries a bare text fragment, "ai:step" one of
+// these, "ai:done" nothing at all.
+export type AgentStep = {
+  kind: "thinking" | "tool" | "tool_done" | "awaiting_approval";
+  name?: string;
+};
+
 export type AgentResult = {
   messages: ChatMessage[];
   pending: PendingAction[];

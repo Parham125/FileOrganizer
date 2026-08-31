@@ -432,6 +432,26 @@ function mockBridge(): Bridge {
     });
   }
 
+  // Mirrors the desktop agent loop: a thinking beat, each read tool opening and
+  // closing, then the reply arriving a word at a time.
+  async function streamTurn(tools: string[], text: string): Promise<void> {
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    emit("ai:step", { kind: "thinking" });
+    await wait(200);
+    for (const name of tools) {
+      emit("ai:step", { kind: "tool", name });
+      await wait(320);
+      emit("ai:step", { kind: "tool_done", name });
+      await wait(110);
+    }
+    emit("ai:step", { kind: "thinking" });
+    await wait(150);
+    for (const frag of text.split(/(?<=\s)/)) {
+      emit("ai:delta", frag);
+      await wait(14);
+    }
+  }
+
   const invoke = async <T>(
     cmd: string,
     args: Record<string, unknown> = {},
@@ -718,18 +738,28 @@ function mockBridge(): Bridge {
             "/Users/you/Downloads/ridge.jpg",
             "/Users/you/Desktop/ridge copy.jpg",
           ];
+          const reply = [
+            "I hashed everything under `~/Downloads` and found **3 files** that are byte-for-byte copies of files you keep elsewhere. Trashing the extras frees 14.6 MB.",
+            "",
+            "| Keeping | Extra copy | Size |",
+            "| --- | --- | --- |",
+            "| `Documents/Invoices/invoice-2214.pdf` | `Downloads/invoice-2214.pdf` | 214 KB |",
+            "| `Pictures/wallpapers/ridge.jpg` | `Downloads/ridge.jpg` | 5.1 MB |",
+            "| `Pictures/wallpapers/ridge.jpg` | `Desktop/ridge copy.jpg` | 5.1 MB |",
+            "",
+            "Trash is reversible here, so anything you change your mind about comes back from the Trash view.",
+          ].join("\n");
+          await streamTurn(["find_duplicates"], reply);
+          emit("ai:step", { kind: "awaiting_approval" });
+          emit("ai:done", undefined);
           const messages: ChatMessage[] = [
             ...incoming,
             ...toolTurn(
-              "scan_duplicates",
+              "find_duplicates",
               { root: "/Users/you/Downloads" },
               "Found 3 duplicate sets, 14.6 MB reclaimable.",
             ),
-            {
-              role: "assistant",
-              content:
-                "I scanned Downloads and found 3 files that are exact duplicates of copies you already keep elsewhere. I can move these extras to Trash. Nothing is deleted for good, so you can restore them anytime.",
-            },
+            { role: "assistant", content: reply },
           ];
           const pending: PendingAction[] = [
             {
@@ -746,11 +776,34 @@ function mockBridge(): Bridge {
             done: false,
           } as AgentResult as T;
         }
-        const reply =
-          "Your largest folders are Downloads (1.4 GB) and Pictures (830 MB). The single biggest file is a meeting recording at 1.24 GB on your Desktop. Want me to look for anything you can safely clear?";
+        const reply = [
+          "Across the **24,817 files** in the index, `~/Downloads` is the heaviest folder at 1.4 GB, and almost none of it has been opened in the last month.",
+          "",
+          "Three things stand out:",
+          "",
+          "- `setup-arm64.dmg` at 512 MB, an installer you already ran",
+          "- `dataset-v2.csv` and `dataset-v3.csv`, near-identical exports",
+          "- `meeting recording.mov` on the Desktop, 1.24 GB by itself",
+          "",
+          "The same list from a shell, if you want to check my work:",
+          "",
+          "```sh",
+          "find ~/Downloads -type f -size +100M -mtime +30 \\",
+          '  -exec du -h "{}" + | sort -rh | head',
+          "```",
+          "",
+          "Say the word and I will stage the safe ones for Trash.",
+        ].join("\n");
+        await streamTurn(["index_stats", "search_files"], reply);
+        emit("ai:done", undefined);
         const messages: ChatMessage[] = [
           ...incoming,
           ...toolTurn("index_stats", {}, "24,817 files indexed."),
+          ...toolTurn(
+            "search_files",
+            { min_size: 104_857_600 },
+            "12 files over 100 MB.",
+          ),
           { role: "assistant", content: reply },
         ];
         return {
@@ -774,6 +827,8 @@ function mockBridge(): Bridge {
         else
           final_text =
             "No problem, I left everything where it is. Nothing was changed.";
+        await streamTurn(approved > 0 ? ["trash_files"] : [], final_text);
+        emit("ai:done", undefined);
         const messages: ChatMessage[] = [...incoming];
         if (approved > 0) {
           const op = "op_" + rid();

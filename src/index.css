@@ -58,7 +58,8 @@
   --color-brick: var(--brick);
   --color-brick-soft: var(--brick-soft);
   --font-sans:
-    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
@@ -95,4 +96,34 @@ body {
 
 .fo-spin {
   animation: fo-spin 0.7s linear infinite;
+}
+
+@keyframes fo-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.fo-pulse {
+  animation: fo-pulse 1.1s ease-in-out infinite;
+}
+
+/* Caret trailing the last line of a reply that is still arriving. */
+@keyframes fo-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.fo-streaming .fo-md > *:last-child:not(ul, ol, blockquote, div)::after,
+.fo-streaming .fo-md > :is(ul, ol):last-child > li:last-child::after,
+.fo-streaming .fo-md > blockquote:last-child > *:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 0.95em;
+  margin-left: 3px;
+  vertical-align: -0.13em;
+  background: var(--teal);
+  animation: fo-blink 1.05s steps(2, start) infinite;
 }

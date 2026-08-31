@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 const MAX_STEPS: usize = 8;
 const DUP_GROUP_CAP: usize = 100;
@@ -344,13 +344,20 @@ async fn run_loop(
     client: &OpenRouter,
     mut messages: Value,
     state: &AppState,
+    app: &AppHandle,
 ) -> Result<AgentResult> {
     for _ in 0..MAX_STEPS {
-        let msg = client.chat_raw(messages.clone(), Some(tools())).await?;
+        let _ = app.emit("ai:step", json!({"kind": "thinking"}));
+        let msg = client
+            .chat_raw_stream(messages.clone(), Some(tools()), |delta| {
+                let _ = app.emit("ai:delta", delta);
+            })
+            .await?;
         push_message(&mut messages, msg.clone());
         let tool_calls: Vec<Value> = msg["tool_calls"].as_array().cloned().unwrap_or_default();
         if tool_calls.is_empty() {
             let final_text = msg["content"].as_str().map(|s| s.to_string());
+            let _ = app.emit("ai:done", ());
             return Ok(AgentResult {
                 messages,
                 pending: Vec::new(),
@@ -371,10 +378,12 @@ async fn run_loop(
                 let id = tc["id"].as_str().unwrap_or("");
                 let name = tc["function"]["name"].as_str().unwrap_or("");
                 let args = parse_args(tc);
+                let _ = app.emit("ai:step", json!({"kind": "tool", "name": name}));
                 let content = match execute_read_tool(name, &args, &index) {
                     Ok(v) => v.to_string(),
                     Err(e) => format!("Error: {}", e),
                 };
+                let _ = app.emit("ai:step", json!({"kind": "tool_done", "name": name}));
                 tool_msgs.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
             }
         }
@@ -396,6 +405,8 @@ async fn run_loop(
                 })
                 .collect();
             let final_text = msg["content"].as_str().map(|s| s.to_string());
+            let _ = app.emit("ai:step", json!({"kind": "awaiting_approval"}));
+            let _ = app.emit("ai:done", ());
             return Ok(AgentResult {
                 messages,
                 pending,
@@ -404,6 +415,7 @@ async fn run_loop(
             });
         }
     }
+    let _ = app.emit("ai:done", ());
     Ok(AgentResult {
         messages,
         pending: Vec::new(),
@@ -424,6 +436,7 @@ fn starts_with_system(messages: &Value) -> bool {
 pub async fn ai_agent(
     messages: Value,
     model: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
     let key = crate::get_key().ok_or_else(|| "No API key set".to_string())?;
@@ -434,7 +447,7 @@ pub async fn ai_agent(
             arr.insert(0, json!({"role": "system", "content": SYSTEM}));
         }
     }
-    run_loop(&client, messages, state.inner())
+    run_loop(&client, messages, state.inner(), &app)
         .await
         .map_err(|e| e.to_string())
 }
@@ -444,6 +457,7 @@ pub async fn ai_agent_continue(
     messages: Value,
     approvals: Value,
     model: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
     let key = crate::get_key().ok_or_else(|| "No API key set".to_string())?;
@@ -488,7 +502,7 @@ pub async fn ai_agent_continue(
     for m in tool_msgs {
         push_message(&mut messages, m);
     }
-    run_loop(&client, messages, state.inner())
+    run_loop(&client, messages, state.inner(), &app)
         .await
         .map_err(|e| e.to_string())
 }
