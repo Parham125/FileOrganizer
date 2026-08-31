@@ -7,12 +7,12 @@ import PageHeader from "../components/PageHeader";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
 import StoppedNotice from "../components/StoppedNotice";
+import RevealButton from "../components/FileActions";
 import ContentSearchView from "./ContentSearchView";
 import {
   IconCheck,
   IconChevron,
   IconFolder,
-  IconReveal,
   IconSearch,
   IconTrash,
 } from "../components/icons";
@@ -477,14 +477,10 @@ function FilenameSearch({
                         {h.path}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => reveal(h.path)}
-                      aria-label={`Reveal ${h.name} in Finder`}
-                      className="shrink-0 rounded-md p-1.5 text-ink-faint opacity-0 transition-opacity hover:bg-surface-2 hover:text-ink focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal group-hover:opacity-100"
-                    >
-                      <IconReveal className="h-4 w-4" />
-                    </button>
+                    <RevealButton
+                      name={h.name}
+                      onReveal={() => reveal(h.path)}
+                    />
                     <div className="w-20 shrink-0 text-right font-mono text-xs tabular-nums text-ink-soft">
                       {formatSize(h.size)}
                     </div>

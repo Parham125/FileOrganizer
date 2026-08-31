@@ -38,6 +38,17 @@ pub struct ExtStat {
     pub total_size: i64,
 }
 
+/// An indexed root plus whether it can be reached right now. A root on an
+/// unplugged external drive keeps every one of its `file_count` rows in the
+/// index, so search still lists them; `available` is how the UI says they cannot
+/// be opened and why a content scan will come back short.
+#[derive(Debug, Clone, Serialize)]
+pub struct RootStatus {
+    pub path: String,
+    pub available: bool,
+    pub file_count: i64,
+}
+
 /// Full-text search index backed by SQLite FTS5 (trigram tokenizer).
 pub struct Index {
     conn: Connection,
@@ -218,6 +229,44 @@ impl Index {
             .prepare("SELECT path FROM roots ORDER BY added_ns, path")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<Vec<String>, _>>()?)
+    }
+
+    /// How many indexed rows sit under `dir`. Anchored on the separator, so
+    /// `/tmp/x/data` never counts `/tmp/x/data2`.
+    pub fn count_under(&self, dir: &Path) -> Result<i64> {
+        let (_, like) = dir_prefix(dir);
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path LIKE ?1 ESCAPE '\\'",
+            [&like],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every indexed root with its live reachability and row count. A root whose
+    /// drive is unplugged reports `available: false` and keeps its count: the
+    /// rows are still searchable, the files just cannot be opened or hashed.
+    pub fn roots_status(&self) -> Result<Vec<RootStatus>> {
+        let mut out = Vec::new();
+        for path in self.list_roots()? {
+            let dir = std::path::PathBuf::from(&path);
+            out.push(RootStatus {
+                available: dir.is_dir(),
+                file_count: self.count_under(&dir)?,
+                path,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Just the roots that cannot be reached right now, for the scans that have
+    /// to say what they could not look at.
+    pub fn unavailable_roots(&self) -> Result<Vec<String>> {
+        Ok(self
+            .roots_status()?
+            .into_iter()
+            .filter(|r| !r.available)
+            .map(|r| r.path)
+            .collect())
     }
 
     /// Indexed files whose size is shared by at least one other indexed file:
@@ -533,6 +582,49 @@ mod tests {
     }
 
     #[test]
+    fn roots_status_reports_a_disconnected_drive_and_keeps_its_count() {
+        let dir = tempfile::tempdir().unwrap();
+        // data2 collides with data as a string prefix: only the separator
+        // anchoring keeps their counts apart
+        let data = dir.path().join("data");
+        let data2 = dir.path().join("data2");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&data2).unwrap();
+        fs::write(data.join("a.txt"), b"a").unwrap();
+        fs::write(data.join("b.txt"), b"bb").unwrap();
+        fs::write(data2.join("c.txt"), b"ccc").unwrap();
+        let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
+        for root in [&data, &data2] {
+            let entries = WalkdirSource.enumerate(root).unwrap();
+            idx.upsert_batch(&entries).unwrap();
+            idx.add_root(root).unwrap();
+        }
+        // stand in for unplugging the drive: the folder goes, the rows stay
+        fs::remove_dir_all(&data).unwrap();
+        let status = idx.roots_status().unwrap();
+        assert_eq!(status.len(), 2);
+        let gone = status
+            .iter()
+            .find(|r| r.path == data.to_string_lossy())
+            .unwrap();
+        assert!(!gone.available);
+        assert_eq!(
+            gone.file_count, 2,
+            "the index keeps the rows of a gone root"
+        );
+        let here = status
+            .iter()
+            .find(|r| r.path == data2.to_string_lossy())
+            .unwrap();
+        assert!(here.available);
+        assert_eq!(here.file_count, 1, "data2 must not absorb data's rows");
+        assert_eq!(
+            idx.unavailable_roots().unwrap(),
+            vec![data.to_string_lossy().to_string()]
+        );
+    }
+
+    #[test]
     fn size_candidates_find_duplicates_across_separate_roots() {
         let dir = tempfile::tempdir().unwrap();
         // two trees standing in for two drives, each holding the same file
@@ -558,6 +650,7 @@ mod tests {
             fo_hasher::HashAlgo::Blake3,
             fo_dedup::ScanMode::Auto,
             &std::sync::atomic::AtomicBool::new(false),
+            &std::sync::atomic::AtomicUsize::new(0),
             |_, _| {},
         );
         assert_eq!(groups.len(), 1);

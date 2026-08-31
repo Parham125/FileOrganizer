@@ -11,6 +11,10 @@ import type {
 } from "../types";
 import PageHeader from "../components/PageHeader";
 import Pager from "../components/Pager";
+import RevealButton, {
+  FileActionError,
+  useFileActions,
+} from "../components/FileActions";
 import ResultFilters, {
   NoFilterMatch,
   useGroupFilter,
@@ -100,9 +104,18 @@ function defaultRemoval(g: DupGroup): Set<string> {
 // What the scan reads: the whole index across every drive, or one picked folder.
 type DupScope = "indexed" | "folder";
 
-// Defined once so the filter hook can memoize on it.
+// Defined once so the filter hook can memoize on them. Every copy in a set
+// weighs the same, so the size filter takes a whole set or leaves it whole.
 function pathsOf(g: DupGroup): string[] {
   return g.paths;
+}
+
+function sizesOf(g: DupGroup): number[] {
+  return g.paths.map(() => g.size);
+}
+
+function keepOnly(g: DupGroup, paths: Set<string>): DupGroup {
+  return { ...g, paths: g.paths.filter((p) => paths.has(p)) };
 }
 
 // Anything outside /Volumes sits on the drive the system booted from. Used only
@@ -156,7 +169,8 @@ function ExactDuplicates({
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
-  const filter = useGroupFilter(groups, pathsOf);
+  const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
+  const files = useFileActions();
 
   // Turning the page puts the reader at the top of the new one, not halfway
   // down where the last one ended.
@@ -169,7 +183,7 @@ function ExactDuplicates({
   // first page of what is left rather than on an empty page 7.
   useEffect(() => {
     setPage(0);
-  }, [filter.query, filter.ext]);
+  }, [filter.query, filter.ext, filter.minMb]);
 
   useEffect(() => {
     const un = listen<Progress>("dedup:progress", (p) => setProgress(p));
@@ -255,22 +269,22 @@ function ExactDuplicates({
   // so the running totals have to as well, or paging or filtering away would
   // look like losing the picks. hidden is what the filter is covering up.
   const summary = useMemo(() => {
-    const visible = new Set((filter.filtered ?? []).map((g) => g.hash));
     let count = 0;
     let bytes = 0;
     let invalid = 0;
     let sets = 0;
     let hidden = 0;
     for (const g of groups ?? []) {
-      const rm = selection[g.hash]?.size ?? 0;
+      const sel = selection[g.hash];
+      const rm = sel?.size ?? 0;
       if (rm >= g.paths.length) invalid++;
       if (rm > 0) sets++;
       count += rm;
       bytes += rm * g.size;
-      if (rm > 0 && !visible.has(g.hash)) hidden += rm;
+      for (const p of sel ?? []) if (!filter.shows(p)) hidden++;
     }
     return { count, bytes, invalid, sets, hidden };
-  }, [groups, selection, filter.filtered]);
+  }, [groups, selection, filter.shows]);
 
   const wasted = useMemo(
     () => (groups ?? []).reduce((s, g) => s + g.size * (g.paths.length - 1), 0),
@@ -429,12 +443,15 @@ function ExactDuplicates({
                 (scanning ? " pointer-events-none opacity-60" : "")
               }
             >
+              {/* Named against the size filter under the results: this one
+                  decides what gets hashed, that one decides what is listed. */}
+              <p className="text-xs font-medium text-ink">Skip files under</p>
               <Segmented<string>
-                ariaLabel="Smallest file the scan compares"
+                ariaLabel="Skip files under this size"
                 value={String(minMb)}
                 onChange={(v) => setMinMb(Number(v))}
                 options={[
-                  { value: "0", label: "All" },
+                  { value: "0", label: "Nothing" },
                   { value: "1", label: "1 MB" },
                   { value: "10", label: "10 MB" },
                   { value: "100", label: "100 MB" },
@@ -442,8 +459,8 @@ function ExactDuplicates({
               />
               <p className="max-w-xs text-xs leading-relaxed text-ink-soft">
                 {minMb === 0
-                  ? "Compares every file. Tiny files repeat on every drive, so expect a long list of sets that free almost nothing."
-                  : `Skips files under ${minMb} MB. Small files repeat across drives in the thousands and barely free any space.`}
+                  ? "Hashes every file. Tiny files repeat on every drive, so expect a long list of sets that free almost nothing."
+                  : `Never hashes a file under ${minMb} MB, which is most of the work. To hide small files from results you already have, use the size filter above the list.`}
               </p>
             </div>
           )}
@@ -585,35 +602,45 @@ function ExactDuplicates({
                   <ul>
                     {g.paths.map((p) => {
                       const remove = sel.has(p);
-                      const name = p.slice(p.lastIndexOf("/") + 1);
-                      const dir = p.slice(0, p.lastIndexOf("/"));
+                      const cut = Math.max(
+                        p.lastIndexOf("/"),
+                        p.lastIndexOf("\\"),
+                      );
+                      const name = p.slice(cut + 1);
+                      const dir = p.slice(0, cut);
                       return (
                         <li key={p}>
-                          <label className="flex cursor-pointer items-center gap-3 border-b border-line/60 px-4 py-2.5 last:border-b-0 hover:bg-surface-2/50">
-                            <span
-                              className={
-                                "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
-                                (remove
-                                  ? "border-brick bg-brick text-white"
-                                  : "border-line-strong bg-surface")
-                              }
-                            >
-                              <input
-                                type="checkbox"
-                                checked={remove}
-                                onChange={() => toggle(g.hash, p)}
-                                className="sr-only"
-                              />
-                              {remove && <IconCheck className="h-3 w-3" />}
-                            </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="block truncate text-sm text-ink">
-                                {name}
+                          <div
+                            onDoubleClick={() => files.open(p)}
+                            className="flex items-center gap-2 border-b border-line/60 px-4 py-2.5 last:border-b-0 hover:bg-surface-2/50"
+                          >
+                            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                              <span
+                                className={
+                                  "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
+                                  (remove
+                                    ? "border-brick bg-brick text-white"
+                                    : "border-line-strong bg-surface")
+                                }
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={remove}
+                                  onChange={() => toggle(g.hash, p)}
+                                  aria-label={`Remove ${name}`}
+                                  className="sr-only"
+                                />
+                                {remove && <IconCheck className="h-3 w-3" />}
                               </span>
-                              <span className="block truncate font-mono text-xs text-ink-faint">
-                                {dir}
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-sm text-ink">
+                                  {name}
+                                </span>
+                                <span className="block truncate font-mono text-xs text-ink-faint">
+                                  {dir}
+                                </span>
                               </span>
-                            </span>
+                            </label>
                             <span
                               className={
                                 "shrink-0 text-xs " +
@@ -622,7 +649,14 @@ function ExactDuplicates({
                             >
                               {remove ? "Remove" : "Keep"}
                             </span>
-                          </label>
+                            <RevealButton
+                              name={name}
+                              onReveal={() => files.reveal(p)}
+                            />
+                          </div>
+                          {files.failed?.path === p && (
+                            <FileActionError message={files.failed.message} />
+                          )}
                         </li>
                       );
                     })}

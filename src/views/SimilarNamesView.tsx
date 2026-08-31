@@ -13,6 +13,10 @@ import ResultFilters, {
   NoFilterMatch,
   useGroupFilter,
 } from "../components/ResultFilters";
+import RevealButton, {
+  FileActionError,
+  useFileActions,
+} from "../components/FileActions";
 import ScanModePicker from "../components/ScanModePicker";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
@@ -31,9 +35,24 @@ function keyOf(g: NameGroup): string {
   return `${g.stem}|${g.ext}|${g.year ?? ""}`;
 }
 
-// Defined once so the filter hook can memoize on it.
+// Defined once so the filter hook can memoize on them. Files in a name set can
+// weigh wildly different amounts, so the size filter can take part of a set and
+// leave the rest, and the header has to be rebuilt around what is left.
 function pathsOf(g: NameGroup): string[] {
   return g.files.map((f) => f.path);
+}
+
+function sizesOf(g: NameGroup): number[] {
+  return g.files.map((f) => f.size);
+}
+
+function keepOnly(g: NameGroup, paths: Set<string>): NameGroup {
+  const files = g.files.filter((f) => paths.has(f.path));
+  return {
+    ...g,
+    files,
+    all_same_size: files.every((f) => f.size === files[0].size),
+  };
 }
 
 export default function SimilarNamesView({
@@ -63,7 +82,8 @@ export default function SimilarNamesView({
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
-  const filter = useGroupFilter(groups, pathsOf);
+  const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
+  const files = useFileActions();
 
   function goPage(next: number) {
     setPage(next);
@@ -90,7 +110,7 @@ export default function SimilarNamesView({
   // first page of what is left rather than on an empty page 7.
   useEffect(() => {
     setPage(0);
-  }, [filter.query, filter.ext]);
+  }, [filter.query, filter.ext, filter.minMb]);
 
   function chooseScope(next: NameScope) {
     chosen.current = true;
@@ -151,7 +171,6 @@ export default function SimilarNamesView({
   // Over every loaded group, not just the visible ones: a pick made before the
   // filter went on is still a pick, and it is still going to the Trash.
   const summary = useMemo(() => {
-    const visible = new Set((filter.filtered ?? []).map(keyOf));
     let count = 0;
     let bytes = 0;
     let invalid = 0;
@@ -164,16 +183,18 @@ export default function SimilarNamesView({
       sets++;
       count += sel.size;
       for (const f of g.files) if (sel.has(f.path)) bytes += f.size;
-      if (!visible.has(keyOf(g))) hidden += sel.size;
+      for (const p of sel) if (!filter.shows(p)) hidden++;
     }
     return { count, bytes, invalid, sets, hidden };
-  }, [groups, selection, filter.filtered]);
+  }, [groups, selection, filter.shows]);
 
   const nothingIndexed = roots !== null && roots.length === 0;
   const listed = filter.filtered?.length ?? 0;
   const pages = Math.max(1, Math.ceil(listed / PER_PAGE));
   const from = page * PER_PAGE;
-  const shown = filter.filtered ? filter.filtered.slice(from, from + PER_PAGE) : [];
+  const shown = filter.filtered
+    ? filter.filtered.slice(from, from + PER_PAGE)
+    : [];
   const media = strategy === "media";
 
   async function trashSelected() {
@@ -186,7 +207,10 @@ export default function SimilarNamesView({
       await invoke<string>("trash_files", { paths, reason: "dedup" });
       const removed = new Set(paths);
       const remaining = (groups ?? [])
-        .map((g) => ({ ...g, files: g.files.filter((f) => !removed.has(f.path)) }))
+        .map((g) => ({
+          ...g,
+          files: g.files.filter((f) => !removed.has(f.path)),
+        }))
         .filter((g) => g.files.length > 1);
       setGroups(remaining);
       setGroupCount(remaining.length);
@@ -307,7 +331,8 @@ export default function SimilarNamesView({
         <div className="flex flex-wrap items-start gap-x-10 gap-y-4">
           <div
             className={
-              "space-y-1.5" + (scanning ? " pointer-events-none opacity-60" : "")
+              "space-y-1.5" +
+              (scanning ? " pointer-events-none opacity-60" : "")
             }
           >
             <Segmented<NameStrategy>
@@ -433,6 +458,7 @@ export default function SimilarNamesView({
                     group={g}
                     selected={selection[keyOf(g)] ?? new Set<string>()}
                     onToggle={(p) => toggle(keyOf(g), p)}
+                    files={files}
                   />
                 ))}
               </div>
@@ -546,10 +572,12 @@ function NameGroupCard({
   group,
   selected,
   onToggle,
+  files,
 }: {
   group: NameGroup;
   selected: Set<string>;
   onToggle: (path: string) => void;
+  files: ReturnType<typeof useFileActions>;
 }) {
   const media = group.strategy === "media";
   const largest = Math.max(...group.files.map((f) => f.size), 1);
@@ -577,9 +605,7 @@ function NameGroupCard({
             </div>
             <div className="text-xs text-ink-faint">
               {group.files.length} files{" "}
-              {media
-                ? "share this title across containers"
-                : "share this name"}
+              {media ? "share this title across containers" : "share this name"}
             </div>
           </div>
         </div>
@@ -609,54 +635,59 @@ function NameGroupCard({
               : "bare name";
           return (
             <li key={f.path}>
-              <label className="flex cursor-pointer items-start gap-3 border-b border-line/60 px-4 py-3 last:border-b-0 hover:bg-surface-2/50">
-                <span
-                  className={
-                    "mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
-                    (remove
-                      ? "border-brick bg-brick text-white"
-                      : "border-line-strong bg-surface")
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={remove}
-                    onChange={() => onToggle(f.path)}
-                    aria-label={`Remove ${name}`}
-                    className="sr-only"
-                  />
-                  {remove && <IconCheck className="h-3 w-3" />}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm text-ink">
-                    {name}
+              <div
+                onDoubleClick={() => files.open(f.path)}
+                className="flex items-start gap-2 border-b border-line/60 px-4 py-3 last:border-b-0 hover:bg-surface-2/50"
+              >
+                <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-3">
+                  <span
+                    className={
+                      "mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
+                      (remove
+                        ? "border-brick bg-brick text-white"
+                        : "border-line-strong bg-surface")
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={remove}
+                      onChange={() => onToggle(f.path)}
+                      aria-label={`Remove ${name}`}
+                      className="sr-only"
+                    />
+                    {remove && <IconCheck className="h-3 w-3" />}
                   </span>
-                  <span className="block truncate font-mono text-xs text-ink-faint">
-                    {dir}
-                  </span>
-                  {/* Size against the biggest file in the set, and what put
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm text-ink">
+                      {name}
+                    </span>
+                    <span className="block truncate font-mono text-xs text-ink-faint">
+                      {dir}
+                    </span>
+                    {/* Size against the biggest file in the set, and what put
                       this file in the set, on one quiet line. */}
-                  <span className="mt-1.5 flex items-center gap-2">
-                    {!group.all_same_size && (
-                      <span
-                        aria-hidden="true"
-                        className="block h-[3px] w-20 shrink-0 rounded-[2px] bg-surface-2"
-                      >
+                    <span className="mt-1.5 flex items-center gap-2">
+                      {!group.all_same_size && (
                         <span
-                          className="block h-full rounded-[2px] bg-ochre"
-                          style={{
-                            width: `${Math.max(4, (f.size / largest) * 100)}%`,
-                          }}
-                        />
-                      </span>
-                    )}
-                    {why && (
-                      <span className="min-w-0 truncate font-mono text-xs text-ink-faint">
-                        {why}
-                      </span>
-                    )}
+                          aria-hidden="true"
+                          className="block h-[3px] w-20 shrink-0 rounded-[2px] bg-surface-2"
+                        >
+                          <span
+                            className="block h-full rounded-[2px] bg-ochre"
+                            style={{
+                              width: `${Math.max(4, (f.size / largest) * 100)}%`,
+                            }}
+                          />
+                        </span>
+                      )}
+                      {why && (
+                        <span className="min-w-0 truncate font-mono text-xs text-ink-faint">
+                          {why}
+                        </span>
+                      )}
+                    </span>
                   </span>
-                </span>
+                </label>
                 <span className="shrink-0 text-right">
                   <span
                     className={
@@ -673,7 +704,15 @@ function NameGroupCard({
                     <span className="block text-xs text-brick">Remove</span>
                   )}
                 </span>
-              </label>
+                <RevealButton
+                  name={name}
+                  onReveal={() => files.reveal(f.path)}
+                  className="-mt-0.5"
+                />
+              </div>
+              {files.failed?.path === f.path && (
+                <FileActionError message={files.failed.message} />
+              )}
             </li>
           );
         })}

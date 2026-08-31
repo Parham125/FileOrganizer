@@ -3,12 +3,8 @@ import { invoke } from "../bridge";
 import { formatRelative, formatSize } from "../format";
 import type { StorageStats } from "../types";
 import PageHeader from "../components/PageHeader";
-import {
-  IconCheck,
-  IconRestore,
-  IconReveal,
-  IconTrash,
-} from "../components/icons";
+import RevealButton from "../components/FileActions";
+import { IconCheck, IconRestore, IconTrash } from "../components/icons";
 
 export default function InsightsView() {
   const [stats, setStats] = useState<StorageStats | null>(null);
@@ -57,7 +53,9 @@ export default function InsightsView() {
     try {
       await invoke("reveal_file", { path });
     } catch (e) {
-      setError(`Could not reveal file: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not reveal file: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -65,7 +63,9 @@ export default function InsightsView() {
     try {
       await invoke("open_file", { path });
     } catch (e) {
-      setError(`Could not open file: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not open file: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -77,12 +77,15 @@ export default function InsightsView() {
       setSelected(new Set());
       await load();
     } catch (e) {
-      setError(`Could not move files: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
   const empty = stats !== null && stats.files === 0;
-  const maxExt = stats?.by_ext.reduce((m, e) => Math.max(m, e.total_size), 0) ?? 0;
+  const maxExt =
+    stats?.by_ext.reduce((m, e) => Math.max(m, e.total_size), 0) ?? 0;
   const largestSum = stats?.largest.reduce((s, h) => s + h.size, 0) ?? 0;
   const largestShare =
     stats && stats.total_size > 0
@@ -139,7 +142,9 @@ export default function InsightsView() {
               <span className="text-[2.6rem] leading-none sm:text-[3.25rem]">
                 {heroNum}
               </span>
-              <span className="text-xl text-ink-soft sm:text-2xl">{heroUnit}</span>
+              <span className="text-xl text-ink-soft sm:text-2xl">
+                {heroUnit}
+              </span>
             </div>
             <p className="mt-3.5 max-w-lg text-sm leading-relaxed text-ink-soft">
               across{" "}
@@ -171,7 +176,9 @@ export default function InsightsView() {
                 <span className="hidden text-right sm:block">Files</span>
               </div>
               {stats.by_ext.map((e) => {
-                const share = Math.round((e.total_size / stats.total_size) * 100);
+                const share = Math.round(
+                  (e.total_size / stats.total_size) * 100,
+                );
                 const width = maxExt > 0 ? (e.total_size / maxExt) * 100 : 0;
                 return (
                   <div
@@ -251,14 +258,10 @@ export default function InsightsView() {
                         {h.path}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => reveal(h.path)}
-                      aria-label={`Reveal ${h.name} in Finder`}
-                      className="shrink-0 rounded-md p-1.5 text-ink-faint opacity-0 transition-opacity hover:bg-surface-2 hover:text-ink focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal group-hover:opacity-100"
-                    >
-                      <IconReveal className="h-4 w-4" />
-                    </button>
+                    <RevealButton
+                      name={h.name}
+                      onReveal={() => reveal(h.path)}
+                    />
                     <div className="w-16 shrink-0 text-right font-mono text-xs tabular-nums text-ink">
                       {formatSize(h.size)}
                     </div>

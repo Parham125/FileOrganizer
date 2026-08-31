@@ -10,6 +10,10 @@ import ResultFilters, {
   NoFilterMatch,
   useGroupFilter,
 } from "../components/ResultFilters";
+import RevealButton, {
+  FileActionError,
+  useFileActions,
+} from "../components/FileActions";
 import ScanModePicker from "../components/ScanModePicker";
 import ScanProgress from "../components/ScanProgress";
 import Stack from "../components/Stack";
@@ -18,12 +22,12 @@ import { IconCheck, IconFolder } from "../components/icons";
 
 // Stable across filtering, unlike the position a set happens to sit at.
 function keyOf(g: SimilarGroup): string {
-  return g.paths.join("|");
+  return g.files.map((f) => f.path).join("|");
 }
 
 // Defined once so the filter hook can memoize on it.
 function pathsOf(g: SimilarGroup): string[] {
-  return g.paths;
+  return g.files.map((f) => f.path);
 }
 
 function shortestPath(paths: string[]): string {
@@ -55,7 +59,10 @@ export default function SimilarImagesView({
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
+  // No size accessor: an image scan reports the paths it compared and nothing
+  // about how much they weigh, so the size filter stays out of this mode.
   const filter = useGroupFilter(groups, pathsOf);
+  const files = useFileActions();
 
   useEffect(() => {
     const un = listen<Progress>("similar:progress", (p) => setProgress(p));
@@ -89,7 +96,7 @@ export default function SimilarImagesView({
       setGroups(res.groups);
       setStopped(res.cancelled);
       const sel: Record<string, Set<string>> = {};
-      for (const g of res.groups) sel[keyOf(g)] = defaultRemoval(g.paths);
+      for (const g of res.groups) sel[keyOf(g)] = defaultRemoval(pathsOf(g));
       setSelection(sel);
     } catch (e) {
       setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -113,18 +120,18 @@ export default function SimilarImagesView({
   // Over every loaded set, filtered or not: hiding a set is not deselecting it,
   // so hidden reports what the filter is covering up.
   const summary = useMemo(() => {
-    const visible = new Set((filter.filtered ?? []).map(keyOf));
     let count = 0;
     let invalid = 0;
     let hidden = 0;
     for (const g of groups ?? []) {
-      const rm = selection[keyOf(g)]?.size ?? 0;
-      if (rm >= g.paths.length) invalid++;
+      const sel = selection[keyOf(g)];
+      const rm = sel?.size ?? 0;
+      if (rm >= g.files.length) invalid++;
       count += rm;
-      if (rm > 0 && !visible.has(keyOf(g))) hidden += rm;
+      for (const p of sel ?? []) if (!filter.shows(p)) hidden++;
     }
     return { count, invalid, hidden };
-  }, [groups, selection, filter.filtered]);
+  }, [groups, selection, filter.shows]);
 
   async function trashSelected() {
     const paths: string[] = [];
@@ -135,11 +142,11 @@ export default function SimilarImagesView({
       await invoke<string>("trash_files", { paths, reason: "dedup" });
       const removed = new Set(paths);
       const remaining = (groups ?? [])
-        .map((g) => ({ ...g, paths: g.paths.filter((p) => !removed.has(p)) }))
-        .filter((g) => g.paths.length > 1);
+        .map((g) => ({ ...g, files: g.files.filter((f) => !removed.has(f.path)) }))
+        .filter((g) => g.files.length > 1);
       setGroups(remaining);
       const sel: Record<string, Set<string>> = {};
-      for (const g of remaining) sel[keyOf(g)] = defaultRemoval(g.paths);
+      for (const g of remaining) sel[keyOf(g)] = defaultRemoval(pathsOf(g));
       setSelection(sel);
       setConfirming(false);
       setDone(
@@ -247,7 +254,7 @@ export default function SimilarImagesView({
           <div className="space-y-4">
             {(filter.filtered ?? []).map((g) => {
               const sel = selection[keyOf(g)] ?? new Set<string>();
-              const keeping = g.paths.length - sel.size;
+              const keeping = g.files.length - sel.size;
               return (
                 <div
                   key={keyOf(g)}
@@ -255,10 +262,10 @@ export default function SimilarImagesView({
                 >
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
                     <div className="flex items-center gap-3">
-                      <Stack n={g.paths.length} />
+                      <Stack n={g.files.length} />
                       <div>
                         <div className="text-sm font-medium text-ink">
-                          {g.paths.length} photos look alike
+                          {g.files.length} photos look alike
                         </div>
                         <div className="text-xs text-ink-faint">
                           looks alike (distance{" "}
@@ -279,37 +286,47 @@ export default function SimilarImagesView({
                     </div>
                   </div>
                   <ul>
-                    {g.paths.map((p) => {
+                    {pathsOf(g).map((p) => {
                       const remove = sel.has(p);
-                      const name = p.slice(p.lastIndexOf("/") + 1);
-                      const dir = p.slice(0, p.lastIndexOf("/"));
+                      const cut = Math.max(
+                        p.lastIndexOf("/"),
+                        p.lastIndexOf("\\"),
+                      );
+                      const name = p.slice(cut + 1);
+                      const dir = p.slice(0, cut);
                       return (
                         <li key={p}>
-                          <label className="flex cursor-pointer items-center gap-3 border-b border-line/60 px-4 py-2.5 last:border-b-0 hover:bg-surface-2/50">
-                            <span
-                              className={
-                                "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
-                                (remove
-                                  ? "border-brick bg-brick text-white"
-                                  : "border-line-strong bg-surface")
-                              }
-                            >
-                              <input
-                                type="checkbox"
-                                checked={remove}
-                                onChange={() => toggle(keyOf(g), p)}
-                                className="sr-only"
-                              />
-                              {remove && <IconCheck className="h-3 w-3" />}
-                            </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="block truncate text-sm text-ink">
-                                {name}
+                          <div
+                            onDoubleClick={() => files.open(p)}
+                            className="flex items-center gap-2 border-b border-line/60 px-4 py-2.5 last:border-b-0 hover:bg-surface-2/50"
+                          >
+                            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                              <span
+                                className={
+                                  "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
+                                  (remove
+                                    ? "border-brick bg-brick text-white"
+                                    : "border-line-strong bg-surface")
+                                }
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={remove}
+                                  onChange={() => toggle(keyOf(g), p)}
+                                  aria-label={`Remove ${name}`}
+                                  className="sr-only"
+                                />
+                                {remove && <IconCheck className="h-3 w-3" />}
                               </span>
-                              <span className="block truncate font-mono text-xs text-ink-faint">
-                                {dir}
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-sm text-ink">
+                                  {name}
+                                </span>
+                                <span className="block truncate font-mono text-xs text-ink-faint">
+                                  {dir}
+                                </span>
                               </span>
-                            </span>
+                            </label>
                             <span
                               className={
                                 "shrink-0 text-xs " +
@@ -318,7 +335,14 @@ export default function SimilarImagesView({
                             >
                               {remove ? "Remove" : "Keep"}
                             </span>
-                          </label>
+                            <RevealButton
+                              name={name}
+                              onReveal={() => files.reveal(p)}
+                            />
+                          </div>
+                          {files.failed?.path === p && (
+                            <FileActionError message={files.failed.message} />
+                          )}
                         </li>
                       );
                     })}

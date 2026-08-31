@@ -339,20 +339,25 @@ function makeIndexedDupGroups(): DupGroup[] {
 }
 
 function makeSimilarGroups(): SimilarGroup[] {
+  const f = (path: string, size: number, days: number) => ({
+    path,
+    size,
+    modified_ns: daysAgoNs(days),
+  });
   return [
     {
       distance: 4,
-      paths: [
-        "/Users/you/Pictures/2026/reykjavik-0431.jpg",
-        "/Users/you/Pictures/2026/reykjavik-0432.jpg",
-        "/Users/you/Pictures/2026/reykjavik-0433.jpg",
+      files: [
+        f("/Users/you/Pictures/2026/reykjavik-0431.jpg", 61_800_000, 22),
+        f("/Users/you/Pictures/2026/reykjavik-0432.jpg", 62_100_000, 22),
+        f("/Users/you/Pictures/2026/reykjavik-0433.jpg", 8_900_000, 22),
       ],
     },
     {
       distance: 2,
-      paths: [
-        "/Users/you/Pictures/exports/sunset-final.jpg",
-        "/Users/you/Desktop/sunset-final copy.jpg",
+      files: [
+        f("/Users/you/Pictures/exports/sunset-final.jpg", 5_100_000, 54),
+        f("/Users/you/Desktop/sunset-final copy.jpg", 5_090_000, 12),
       ],
     },
   ];

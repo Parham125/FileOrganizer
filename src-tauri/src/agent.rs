@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tauri::{AppHandle, Emitter, State};
 
 const MAX_STEPS: usize = 8;
@@ -458,11 +458,13 @@ fn run_read_tool(name: &str, args: &Value, index: &Index, rules: &Rules) -> Resu
                 .clamp(1, DUP_PAGE_MAX) as usize;
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
             let entries = WalkdirSource.enumerate(Path::new(root))?;
+            let unreadable = AtomicUsize::new(0);
             let mut groups = find_duplicates(
                 &entries,
                 HashAlgo::Blake3,
                 ScanMode::Auto,
                 &AtomicBool::new(false),
+                &unreadable,
                 |_, _| {},
             );
             // paging is only stable if the order is: biggest waste first, then by
@@ -491,6 +493,8 @@ fn run_read_tool(name: &str, args: &Value, index: &Index, rules: &Rules) -> Resu
                 "offset": offset,
                 "returned": page.len(),
                 "has_more": offset + page.len() < groups.len(),
+                // so the model does not read a short answer as a complete one
+                "unreadable_files": unreadable.load(Ordering::Relaxed),
                 "groups": page
             }))
         }

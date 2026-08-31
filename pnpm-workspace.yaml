@@ -1,2 +1,6 @@
 allowBuilds:
   esbuild: true
+# The Rust crate resolves to 2.11.0 and Tauri refuses to build when the crate
+# and npm package minors differ, so this one has to skip pnpm's release cooldown.
+minimumReleaseAgeExclude:
+  - "@tauri-apps/plugin-updater@2.11.0"

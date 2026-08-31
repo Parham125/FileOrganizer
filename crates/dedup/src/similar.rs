@@ -6,15 +6,27 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::UNIX_EPOCH;
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"];
 /// Guard against the O(n^2) pairwise pass on huge folders.
 const MAX_IMAGES: usize = 5000;
 
+/// One image in a near-duplicate cluster. Same shape as `NameMatch` so the UI
+/// can filter and sort both scans the same way: deciding which copy of a resaved
+/// photo to keep is a question about size, and the metadata is already in hand
+/// from the index, so carrying it costs no extra I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified_ns: Option<i64>,
+}
+
 /// A cluster of perceptually similar (near-duplicate) images.
 #[derive(Debug, Clone, Serialize)]
 pub struct SimilarGroup {
-    pub paths: Vec<PathBuf>,
+    pub files: Vec<SimilarFile>,
     pub distance: u32,
 }
 
@@ -47,11 +59,16 @@ fn uf_find(parent: &mut [usize], mut i: usize) -> usize {
 ///
 /// Raising `cancel` stops the hashing pass and clusters only what was already
 /// hashed; the caller reads the flag afterwards to tell that from a clean run.
+///
+/// `unreadable` counts images that could not be opened or decoded, so a scan
+/// over a drive that went away reports the gap instead of quietly returning
+/// fewer groups.
 pub fn find_similar_images(
     entries: &[FileEntry],
     max_distance: u32,
     mode: ScanMode,
     cancel: &AtomicBool,
+    unreadable: &AtomicUsize,
     progress: impl Fn(usize, usize) + Sync,
 ) -> Vec<SimilarGroup> {
     let mut images: Vec<&FileEntry> = entries.iter().filter(|e| is_image(&e.path)).collect();
@@ -63,14 +80,30 @@ pub fn find_similar_images(
     let total = images.len();
     let done = AtomicUsize::new(0);
     let pool = scan_pool(mode);
-    let hashed: Vec<(PathBuf, ImageHash)> = in_pool(pool.as_ref(), || {
+    let hashed: Vec<(SimilarFile, ImageHash)> = in_pool(pool.as_ref(), || {
         images
             .par_iter()
             .filter_map(|e| {
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                let out = perceptual_hash(&e.path).ok().map(|h| (e.path.clone(), h));
+                let out = match perceptual_hash(&e.path) {
+                    Ok(h) => Some((
+                        SimilarFile {
+                            path: e.path.clone(),
+                            size: e.size,
+                            modified_ns: e
+                                .modified
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .and_then(|d| i64::try_from(d.as_nanos()).ok()),
+                        },
+                        h,
+                    )),
+                    Err(_) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                };
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 progress(n, total);
                 out
@@ -105,12 +138,12 @@ pub fn find_similar_images(
                 }
             }
             SimilarGroup {
-                paths: idx.iter().map(|&i| hashed[i].0.clone()).collect(),
+                files: idx.iter().map(|&i| hashed[i].0.clone()).collect(),
                 distance,
             }
         })
         .collect();
-    groups.sort_by(|a, b| b.paths.len().cmp(&a.paths.len()));
+    groups.sort_by(|a, b| b.files.len().cmp(&a.files.len()));
     groups
 }
 
@@ -149,25 +182,48 @@ mod tests {
             10,
             ScanMode::Sequential,
             &AtomicBool::new(false),
+            &AtomicUsize::new(0),
             |_, _| {},
         );
         assert_eq!(groups.len(), 1, "expected exactly one near-dup group");
-        assert_eq!(groups[0].paths.len(), 2);
+        assert_eq!(groups[0].files.len(), 2);
         let mut names: Vec<String> = groups[0]
-            .paths
+            .files
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         names.sort();
         assert_eq!(names, vec!["base.png", "near.jpg"]);
+        // sizes and times ride along, so the UI can filter by size and show
+        // which copy of a resaved photo is the bigger one
+        for f in &groups[0].files {
+            let on_disk = std::fs::metadata(&f.path).unwrap();
+            assert_eq!(f.size, on_disk.len(), "{}", f.path.display());
+            assert!(f.size > 0);
+            assert!(f.modified_ns.is_some());
+        }
         // cancelling before the first decode leaves nothing to cluster
         let cancelled = find_similar_images(
             &entries,
             10,
             ScanMode::Auto,
             &AtomicBool::new(true),
+            &AtomicUsize::new(0),
             |_, _| {},
         );
         assert!(cancelled.is_empty());
+        // an image that went away with its drive is counted, not dropped quietly
+        std::fs::remove_file(dir.path().join("other.png")).unwrap();
+        let unreadable = AtomicUsize::new(0);
+        let groups = find_similar_images(
+            &entries,
+            10,
+            ScanMode::Sequential,
+            &AtomicBool::new(false),
+            &unreadable,
+            |_, _| {},
+        );
+        assert_eq!(unreadable.load(Ordering::Relaxed), 1);
+        assert_eq!(groups.len(), 1);
     }
 }

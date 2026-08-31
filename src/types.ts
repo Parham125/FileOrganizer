@@ -18,8 +18,14 @@ export type DupGroup = {
   paths: string[];
 };
 
+export type SimilarFile = {
+  path: string;
+  size: number;
+  modified_ns: number | null;
+};
+
 export type SimilarGroup = {
-  paths: string[];
+  files: SimilarFile[];
   distance: number;
 };
 

@@ -3,6 +3,7 @@ import { invoke } from "./bridge";
 import { useLocalStorageState, useModel, useTheme } from "./store";
 import type { HashAlgo, ViewId } from "./types";
 import Sidebar from "./components/Sidebar";
+import UpdateBanner from "./components/UpdateBanner";
 import SearchView from "./views/SearchView";
 import DuplicatesView from "./views/DuplicatesView";
 import InsightsView from "./views/InsightsView";
@@ -66,6 +67,7 @@ export default function App() {
           )}
         </div>
       </main>
+      <UpdateBanner />
     </div>
   );
 }

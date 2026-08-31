@@ -1,0 +1,16 @@
+[package]
+name = "fo-thumbs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+base64 = "0.22"
+blake3 = "1"
+image = "0.25"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"

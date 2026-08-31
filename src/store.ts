@@ -44,6 +44,13 @@ export function useDupMinMb(): [number, (m: number) => void] {
   return useLocalStorageState<number>("fo.dupMinMb", 1);
 }
 
+// Floor for what the result lists show, in MB. Nothing is re-scanned when this
+// moves, so it is shared by every duplicate mode and applies the moment it
+// changes.
+export function useResultMinMb(): [number, (m: number) => void] {
+  return useLocalStorageState<number>("fo.resultMinMb", 0);
+}
+
 export function useTheme(): [Theme, (t: Theme) => void, boolean] {
   const [theme, setTheme] = useLocalStorageState<Theme>("fo.theme", "system");
   const [isDark, setIsDark] = useState(false);

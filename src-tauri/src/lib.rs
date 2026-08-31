@@ -9,18 +9,20 @@ use fo_dedup::{
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
 use fo_rules::{match_rule, Rule, RuleAction, RuleFilter, Rules};
-use fo_search::{ContentHit, ExtStat, Index, SearchHit, SearchOpts};
+use fo_search::{ContentHit, ExtStat, Index, RootStatus, SearchHit, SearchOpts};
+use fo_thumbs::Thumb;
 use fo_trash::{SkippedItem, Trash, TrashItem};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 mod agent;
+mod snapshot;
 
 struct AppState {
     index: Mutex<Index>,
@@ -104,27 +106,42 @@ impl Throttle {
 /// A scan that ran to the end or was stopped part way. `cancelled` is how the
 /// UI tells "found nothing" from "stopped before it could look"; the groups are
 /// whatever was confirmed before the stop, and are safe to act on either way.
+///
+/// `unavailable_roots` and `unreadable_files` are the honesty fields: a content
+/// scan cannot see a drive that is not plugged in, and reporting fewer
+/// duplicates with no explanation reads as an answer when it is not one.
 #[derive(serde::Serialize)]
 struct DupScan {
     /// True number of groups, so the UI does not have to derive it before paging.
     group_count: usize,
     groups: Vec<DupGroup>,
     cancelled: bool,
+    /// Roots the scan covered on paper but could not reach on disk.
+    unavailable_roots: Vec<String>,
+    /// Files that failed to read, so were left out of the grouping.
+    unreadable_files: usize,
 }
 
 #[derive(serde::Serialize)]
 struct SimilarScan {
     groups: Vec<SimilarGroup>,
     cancelled: bool,
+    unavailable_roots: Vec<String>,
+    unreadable_files: usize,
 }
 
 /// A name-similarity scan. Same `cancelled` contract as `DupScan`. These files
 /// share a NAME, not necessarily contents: nothing here was hashed.
+///
+/// Nothing is read here, so `unavailable_roots` is a capability, not a warning:
+/// this scan covers disconnected drives just as well as connected ones. There is
+/// no `unreadable_files` because no file is opened.
 #[derive(serde::Serialize)]
 struct NameScan {
     group_count: usize,
     groups: Vec<NameGroup>,
     cancelled: bool,
+    unavailable_roots: Vec<String>,
 }
 
 /// An index pass. `count` is what actually landed in the index, which is a real
@@ -423,6 +440,20 @@ fn list_indexed_roots(state: State<AppState>) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Every indexed root with whether it is reachable right now and how many rows
+/// it holds. A root on an unplugged drive stays fully searchable, so the UI needs
+/// this to mark those hits as unopenable instead of letting the user find out by
+/// double-clicking one.
+#[tauri::command]
+fn indexed_roots_status(state: State<AppState>) -> Result<Vec<RootStatus>, String> {
+    state
+        .index
+        .lock()
+        .unwrap()
+        .roots_status()
+        .map_err(|e| e.to_string())
+}
+
 /// Forget a folder: drop its rows from the search index, its indexed body text,
 /// and its entry in the indexed-roots list. Returns how many file rows went.
 ///
@@ -478,8 +509,9 @@ fn watch_root(app: &AppHandle, root: PathBuf) -> Result<(), String> {
         return Ok(());
     }
     let handle = app.clone();
+    let watched = root.clone();
     let watcher = Watcher::watch(&root, move |ev| {
-        apply_change(&handle, ev);
+        apply_change(&handle, &watched, ev);
         let _ = handle.emit("index:changed", ());
     })
     .map_err(|e| e.to_string())?;
@@ -487,18 +519,29 @@ fn watch_root(app: &AppHandle, root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_change(app: &AppHandle, ev: ChangeEvent) {
+fn apply_change(app: &AppHandle, root: &Path, ev: ChangeEvent) {
+    // Unplugging a drive can arrive as a removal event for everything on it.
+    // Honouring that would erase the whole drive from the index and force a full
+    // re-index on reconnect, which on a big external disk is punishing. If the
+    // watched root itself is gone, the drive left; the files did not.
+    let root_present = root.is_dir();
     let state = app.state::<AppState>();
     let mut idx = state.index.lock().unwrap();
     match ev {
         ChangeEvent::Created(p) | ChangeEvent::Modified(p) => upsert_one(&mut idx, p),
         ChangeEvent::Removed(p) => {
+            if !root_present {
+                return;
+            }
             let _ = idx.remove_path(&p);
             // body text outlives the file otherwise, and Contents search keeps
             // offering a path that is gone
             let _ = idx.remove_content(&p);
         }
         ChangeEvent::Renamed { from, to } => {
+            if !root_present {
+                return;
+            }
             let _ = idx.remove_path(&from);
             let _ = idx.remove_content(&from);
             // a folder renamed outside the app leaves every indexed child
@@ -540,13 +583,20 @@ async fn scan_duplicates(
             _ => HashAlgo::Blake3,
         };
         let mode = ScanMode::from_label(mode.as_deref());
-        let entries = WalkdirSource
-            .enumerate(&PathBuf::from(&root))
-            .map_err(|e| e.to_string())?;
+        let dir = PathBuf::from(&root);
+        // an unreachable folder is not an error: the scan runs over nothing and
+        // says so, rather than looking like a folder with no duplicates in it
+        let unavailable_roots = if dir.is_dir() {
+            Vec::new()
+        } else {
+            vec![root.clone()]
+        };
+        let entries = WalkdirSource.enumerate(&dir).map_err(|e| e.to_string())?;
         let state = app.state::<AppState>();
         let cancel = begin_scan(&state);
+        let unreadable = AtomicUsize::new(0);
         let throttle = Throttle::new();
-        let groups = find_duplicates(&entries, algo, mode, &cancel, |done, total| {
+        let groups = find_duplicates(&entries, algo, mode, &cancel, &unreadable, |done, total| {
             if throttle.ready(done, total) {
                 let _ = app.emit(
                     "dedup:progress",
@@ -560,6 +610,8 @@ async fn scan_duplicates(
             group_count: groups.len(),
             groups,
             cancelled,
+            unavailable_roots,
+            unreadable_files: unreadable.load(Ordering::Relaxed),
         })
     })
     .await
@@ -569,8 +621,10 @@ async fn scan_duplicates(
 /// Duplicates across everything indexed, on every drive at once, with no
 /// filesystem walk: the index already knows every path and size, so the size
 /// stage is a query and only the survivors are ever read. `minSize` floors that
-/// query (default 1, i.e. everything). Files deleted since they were indexed
-/// fail to hash and drop out silently instead of failing the scan. `algo` and
+/// query (default 1, i.e. everything). Files deleted since they were indexed, or
+/// sitting on a drive that is no longer plugged in, fail to hash and drop out of
+/// the grouping instead of failing the scan; they come back as
+/// `unreadable_files`, and roots that are gone as `unavailable_roots`. `algo` and
 /// `mode` behave as in `scan_duplicates`.
 #[tauri::command]
 async fn scan_duplicates_indexed(
@@ -586,14 +640,18 @@ async fn scan_duplicates_indexed(
         };
         let mode = ScanMode::from_label(mode.as_deref());
         let state = app.state::<AppState>();
-        let entries = {
+        let (entries, unavailable_roots) = {
             let idx = state.index.lock().unwrap();
-            idx.size_collision_candidates(min_size.unwrap_or(1))
-                .map_err(|e| e.to_string())?
+            (
+                idx.size_collision_candidates(min_size.unwrap_or(1))
+                    .map_err(|e| e.to_string())?,
+                idx.unavailable_roots().map_err(|e| e.to_string())?,
+            )
         };
         let cancel = begin_scan(&state);
+        let unreadable = AtomicUsize::new(0);
         let throttle = Throttle::new();
-        let groups = find_duplicates(&entries, algo, mode, &cancel, |done, total| {
+        let groups = find_duplicates(&entries, algo, mode, &cancel, &unreadable, |done, total| {
             if throttle.ready(done, total) {
                 let _ = app.emit(
                     "dedup:progress",
@@ -607,6 +665,8 @@ async fn scan_duplicates_indexed(
             group_count: groups.len(),
             groups,
             cancelled,
+            unavailable_roots,
+            unreadable_files: unreadable.load(Ordering::Relaxed),
         })
     })
     .await
@@ -622,17 +682,23 @@ async fn scan_similar_images(
     app: AppHandle,
 ) -> Result<SimilarScan, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let entries = WalkdirSource
-            .enumerate(&PathBuf::from(&root))
-            .map_err(|e| e.to_string())?;
+        let dir = PathBuf::from(&root);
+        let unavailable_roots = if dir.is_dir() {
+            Vec::new()
+        } else {
+            vec![root.clone()]
+        };
+        let entries = WalkdirSource.enumerate(&dir).map_err(|e| e.to_string())?;
         let state = app.state::<AppState>();
         let cancel = begin_scan(&state);
+        let unreadable = AtomicUsize::new(0);
         let throttle = Throttle::new();
         let groups = find_similar_images(
             &entries,
             max_distance.unwrap_or(10),
             ScanMode::from_label(mode.as_deref()),
             &cancel,
+            &unreadable,
             |done, total| {
                 if throttle.ready(done, total) {
                     let _ = app.emit(
@@ -644,7 +710,12 @@ async fn scan_similar_images(
         );
         let cancelled = cancel.load(Ordering::Relaxed);
         end_scan(&state, &cancel);
-        Ok(SimilarScan { groups, cancelled })
+        Ok(SimilarScan {
+            groups,
+            cancelled,
+            unavailable_roots,
+            unreadable_files: unreadable.load(Ordering::Relaxed),
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -674,13 +745,28 @@ async fn scan_similar_names(
         let _ = mode;
         let strategy = NameStrategy::from_label(strategy.as_deref());
         let state = app.state::<AppState>();
-        let entries = match root {
-            Some(r) => WalkdirSource
-                .enumerate(&PathBuf::from(&r))
-                .map_err(|e| e.to_string())?,
+        // This pass reads no contents, so a root being offline costs it nothing:
+        // the names come from the index either way. The list is reported so the
+        // UI can say the scan covered those drives, not that it missed them.
+        let (entries, unavailable_roots) = match root {
+            Some(r) => {
+                let dir = PathBuf::from(&r);
+                let missing = if dir.is_dir() {
+                    Vec::new()
+                } else {
+                    vec![r.clone()]
+                };
+                (
+                    WalkdirSource.enumerate(&dir).map_err(|e| e.to_string())?,
+                    missing,
+                )
+            }
             None => {
                 let idx = state.index.lock().unwrap();
-                idx.all_files(NAME_SCAN_CAP).map_err(|e| e.to_string())?
+                (
+                    idx.all_files(NAME_SCAN_CAP).map_err(|e| e.to_string())?,
+                    idx.unavailable_roots().map_err(|e| e.to_string())?,
+                )
             }
         };
         let cancel = begin_scan(&state);
@@ -703,6 +789,7 @@ async fn scan_similar_names(
             group_count: groups.len(),
             groups,
             cancelled,
+            unavailable_roots,
         })
     })
     .await
@@ -1006,13 +1093,71 @@ fn set_reasoning_effort(effort: String) -> Result<(), String> {
     write_setting("reasoning_effort", serde_json::json!(parsed))
 }
 
+/// At most this many rows per request, so a runaway UI cannot ask the disk for
+/// a whole scan's worth of thumbnails in one go.
+const MAX_THUMBS_PER_CALL: usize = 200;
+const MAX_THUMB_PX: u32 = 512;
+
+/// Where generated thumbnails live. The OS cache directory is the right home
+/// for them (it is disposable and excluded from backups); the app data dir is
+/// only a fallback for platforms where the cache dir cannot be resolved.
+fn thumb_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_cache_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| e.to_string())?;
+    let dir = base.join("thumbs");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Thumbnails for the rows the UI is currently showing. Generated on demand
+/// and cached on disk, because the target is often a slow external drive and
+/// eagerly previewing thousands of rows would be ruinous there.
+///
+/// Per-path problems (missing file, unreadable image, absurd size) come back in
+/// that entry's `error`; the call itself only fails if the cache dir is
+/// unusable. A file that is not a supported raster image gets neither a
+/// thumbnail nor an error, and the UI just shows nothing.
+#[tauri::command]
+fn get_thumbnails(
+    paths: Vec<String>,
+    max_px: Option<u32>,
+    app: AppHandle,
+) -> Result<Vec<Thumb>, String> {
+    let dir = thumb_cache_dir(&app)?;
+    let paths = if paths.len() > MAX_THUMBS_PER_CALL {
+        &paths[..MAX_THUMBS_PER_CALL]
+    } else {
+        &paths[..]
+    };
+    let max_px = max_px.unwrap_or(96).clamp(16, MAX_THUMB_PX);
+    Ok(fo_thumbs::thumbnails(paths, max_px, &dir))
+}
+
+/// Drop every cached thumbnail and report the bytes freed. Safe at any time:
+/// the next request simply regenerates what it needs.
+#[tauri::command]
+fn clear_thumbnail_cache(app: AppHandle) -> Result<u64, String> {
+    let dir = thumb_cache_dir(&app)?;
+    let freed = dir_size(&dir);
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(freed)
+}
+
 /// What the app is holding on disk, so it can be found and removed by hand.
 /// macOS has no uninstaller, so this is the only way to see it from inside.
+/// The thumbnail cache is reported separately because it normally lives in the
+/// OS cache directory, outside `dir`.
 #[derive(serde::Serialize)]
 struct AppDataSummary {
     dir: String,
     bytes: u64,
     trashed_files: i64,
+    thumbs_dir: String,
+    thumbs_bytes: u64,
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -1041,10 +1186,13 @@ fn app_data_summary(app: AppHandle, state: State<AppState>) -> Result<AppDataSum
         .list(None, 100_000)
         .map(|items| items.iter().filter(|i| !i.restored).count() as i64)
         .unwrap_or(0);
+    let thumbs = thumb_cache_dir(&app).unwrap_or_else(|_| dir.join("thumbs"));
     Ok(AppDataSummary {
         bytes: dir_size(&dir),
         dir: dir.to_string_lossy().to_string(),
         trashed_files,
+        thumbs_bytes: dir_size(&thumbs),
+        thumbs_dir: thumbs.to_string_lossy().to_string(),
     })
 }
 
@@ -1067,6 +1215,11 @@ fn reset_app_data(app: AppHandle, state: State<AppState>) -> Result<(), String> 
     }
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let _ = clear_key();
+    // The thumbnail cache usually sits in the OS cache dir, outside `dir`, so
+    // "delete stored data" has to reach it explicitly.
+    if let Ok(thumbs) = thumb_cache_dir(&app) {
+        let _ = fs::remove_dir_all(&thumbs);
+    }
     fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(())
@@ -1306,6 +1459,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             fs::create_dir_all(&dir)?;
@@ -1361,6 +1515,7 @@ pub fn run() {
             index_content,
             search_content,
             list_indexed_roots,
+            indexed_roots_status,
             remove_indexed_root,
             list_archive,
             start_watch,
@@ -1393,6 +1548,8 @@ pub fn run() {
             get_key_storage,
             app_data_summary,
             reset_app_data,
+            get_thumbnails,
+            clear_thumbnail_cache,
             set_key_storage,
             ai_propose_organization,
             ai_apply_organization,
@@ -1404,7 +1561,10 @@ pub fn run() {
             delete_chat,
             clear_chats,
             agent::ai_agent,
-            agent::ai_agent_continue
+            agent::ai_agent_continue,
+            snapshot::export_results,
+            snapshot::import_results,
+            snapshot::verify_snapshot_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

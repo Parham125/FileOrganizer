@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod names;
 mod similar;
 pub use names::{find_similar_names, NameGroup, NameMatch, NameStrategy};
-pub use similar::{find_similar_images, perceptual_hash, SimilarGroup};
+pub use similar::{find_similar_images, perceptual_hash, SimilarFile, SimilarGroup};
 
 const PARTIAL_BYTES: usize = 8192;
 
@@ -66,11 +66,17 @@ pub struct DupGroup {
 /// Returns early with whatever full-hash groups were already complete when
 /// `cancel` is raised; callers tell "cancelled" from "finished" by reading the
 /// flag afterwards, not from the returned groups.
+///
+/// `unreadable` counts files that could not be read at all (an unplugged drive,
+/// a permission wall, a file deleted since it was indexed). Those files are left
+/// out of the groups, and without the count the scan would under-report
+/// duplicates with nothing to show for it.
 pub fn find_duplicates(
     entries: &[FileEntry],
     algo: HashAlgo,
     mode: ScanMode,
     cancel: &AtomicBool,
+    unreadable: &AtomicUsize,
     progress: impl Fn(usize, usize) + Sync,
 ) -> Vec<DupGroup> {
     let pool = scan_pool(mode);
@@ -95,9 +101,13 @@ pub fn find_duplicates(
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                hash_partial(&e.path, algo, PARTIAL_BYTES)
-                    .ok()
-                    .map(|h| (*e, h))
+                match hash_partial(&e.path, algo, PARTIAL_BYTES) {
+                    Ok(h) => Some((*e, h)),
+                    Err(_) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                }
             })
             .collect()
     });
@@ -126,7 +136,15 @@ pub fn find_duplicates(
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                let out = hash_file(&e.path, algo).ok().map(|h| (*e, h));
+                // a file that failed the partial stage never gets here, so this
+                // cannot double-count the same file
+                let out = match hash_file(&e.path, algo) {
+                    Ok(h) => Some((*e, h)),
+                    Err(_) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                };
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 progress(n, total);
                 out
@@ -166,6 +184,7 @@ mod tests {
             HashAlgo::Blake3,
             mode,
             &AtomicBool::new(false),
+            &AtomicUsize::new(0),
             |_, _| {},
         )
     }
@@ -212,11 +231,45 @@ mod tests {
             HashAlgo::Blake3,
             ScanMode::Sequential,
             &cancel,
+            &AtomicUsize::new(0),
             |_, _| {},
         );
         assert!(
             groups.is_empty(),
             "a cancelled scan must not look like a clean finish"
         );
+    }
+
+    #[test]
+    fn counts_unreadable_files_and_still_groups_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello world contents").unwrap();
+        fs::write(dir.path().join("b.txt"), b"hello world contents").unwrap();
+        // two more of a second size, so the size stage keeps them as candidates
+        fs::write(dir.path().join("gone1.txt"), b"vanishing pair contents").unwrap();
+        fs::write(dir.path().join("gone2.txt"), b"vanishing pair contents").unwrap();
+        let entries = WalkdirSource.enumerate(dir.path()).unwrap();
+        // stand in for an unplugged drive: the index rows survive, the files do not
+        fs::remove_file(dir.path().join("gone1.txt")).unwrap();
+        fs::remove_file(dir.path().join("gone2.txt")).unwrap();
+        let unreadable = AtomicUsize::new(0);
+        let groups = find_duplicates(
+            &entries,
+            HashAlgo::Blake3,
+            ScanMode::Sequential,
+            &AtomicBool::new(false),
+            &unreadable,
+            |_, _| {},
+        );
+        assert_eq!(unreadable.load(Ordering::Relaxed), 2);
+        assert_eq!(groups.len(), 1, "the reachable pair still groups");
+        assert_eq!(groups[0].paths.len(), 2);
+        let mut names: Vec<String> = groups[0]
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
     }
 }

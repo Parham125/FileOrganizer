@@ -9,8 +9,47 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  # tauri-action's own "find the release for this tag, create it if missing" step
+  # is not atomic, so two matrix jobs starting together can each create a release
+  # for the same tag. Creating it once here and handing the id to both build jobs
+  # keeps every artifact on one release.
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create or reuse the release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "FileOrganizer $TAG" \
+              --notes "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. See assets below."
+          fi
+          echo "release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+            targets: ""
+          # One universal binary covers Apple Silicon and Intel, and tauri-action
+          # expands it into both darwin-aarch64 and darwin-x86_64 entries in
+          # latest.json, so a single macOS job is enough.
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +64,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -34,13 +75,19 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
-      - name: Build app and publish release
-        uses: tauri-apps/tauri-action@v0
+      - name: Build app and upload release assets
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # Both are set on purpose: releaseId skips the racy lookup, tagName
+          # keeps the updater download urls pinned to this tag.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           releaseName: "FileOrganizer ${{ github.ref_name }}"
-          releaseBody: "Windows installers built by CI: NSIS (.exe) and MSI (.msi). See assets below."
+          releaseBody: "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. See assets below."
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
