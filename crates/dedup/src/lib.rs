@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod names;
 mod similar;
 pub use names::{find_similar_names, NameGroup, NameMatch, NameStrategy};
-pub use similar::{find_similar_images, perceptual_hash, SimilarFile, SimilarGroup};
+pub use similar::{find_similar_images, perceptual_hash, SimilarFile, SimilarGroup, SimilarResult};
 
 const PARTIAL_BYTES: usize = 8192;
 

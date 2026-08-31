@@ -68,7 +68,11 @@ function defaultRemoval(
   return new Set(live.filter((p) => p !== keep));
 }
 
-type Coverage = { roots: string[]; unreadable: number };
+type Coverage = {
+  roots: string[];
+  unreadable: number;
+  tooMany: number | null;
+};
 
 export default function SimilarImagesView({
   scanMode,
@@ -127,6 +131,7 @@ export default function SimilarImagesView({
     setCoverage({
       roots: payload.unavailable_roots ?? [],
       unreadable: payload.unreadable_files ?? 0,
+      tooMany: payload.too_many_images ?? null,
     });
     setStopped(payload.cancelled ?? false);
     setPage(0);
@@ -177,6 +182,7 @@ export default function SimilarImagesView({
       setCoverage({
         roots: res.unavailable_roots ?? [],
         unreadable: res.unreadable_files ?? 0,
+        tooMany: res.too_many_images ?? null,
       });
       setStopped(res.cancelled);
       const sel: Record<string, Set<string>> = {};
@@ -206,6 +212,7 @@ export default function SimilarImagesView({
           cancelled: stopped,
           unavailable_roots: coverage?.roots ?? [],
           unreadable_files: coverage?.unreadable ?? 0,
+          too_many_images: coverage?.tooMany ?? null,
         } satisfies SimilarPayload,
       );
       if (path) setSaved(`Saved ${groups.length} sets to ${path}`);
@@ -388,10 +395,26 @@ export default function SimilarImagesView({
 
       {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
-          <p className="text-sm font-medium text-ink">No look-alikes found</p>
-          <p className="mt-1 text-sm text-ink-soft">
-            Every image in that folder looks distinct.
-          </p>
+          {coverage?.tooMany ? (
+            <>
+              <p className="text-sm font-medium text-ink">
+                Nothing was compared
+              </p>
+              <p className="mt-1 text-sm text-ink-soft">
+                That folder holds {coverage.tooMany.toLocaleString()} images,
+                more than one pass compares at once. Scan a subfolder at a time.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm font-medium text-ink">
+                No look-alikes found
+              </p>
+              <p className="mt-1 text-sm text-ink-soft">
+                Every image in that folder looks distinct.
+              </p>
+            </>
+          )}
         </div>
       )}
 

@@ -73,11 +73,15 @@ export type DupScanResult = {
   unavailable_roots: string[];
   unreadable_files: number;
 };
+// too_many_images is set only when the folder held more images than the pass
+// will compare, in which case nothing was compared: empty groups there mean
+// "not looked at", not "nothing alike", and the UI has to say which it is.
 export type SimilarScanResult = {
   groups: SimilarGroup[];
   cancelled: boolean;
   unavailable_roots: string[];
   unreadable_files: number;
+  too_many_images?: number | null;
 };
 // Names come from the index and no file is opened, so a disconnected drive is
 // still covered here. No unreadable_files for the same reason.

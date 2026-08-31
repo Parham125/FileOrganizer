@@ -128,6 +128,10 @@ struct SimilarScan {
     cancelled: bool,
     unavailable_roots: Vec<String>,
     unreadable_files: usize,
+    /// Images in the folder when there were too many to compare, in which case
+    /// nothing was compared at all. Null on a scan that ran. Empty `groups` with
+    /// this set is a refusal, not a clean result, and has to read as one.
+    too_many_images: Option<usize>,
 }
 
 /// A name-similarity scan. Same `cancelled` contract as `DupScan`. These files
@@ -693,7 +697,7 @@ async fn scan_similar_images(
         let cancel = begin_scan(&state);
         let unreadable = AtomicUsize::new(0);
         let throttle = Throttle::new();
-        let groups = find_similar_images(
+        let similar = find_similar_images(
             &entries,
             max_distance.unwrap_or(10),
             ScanMode::from_label(mode.as_deref()),
@@ -711,10 +715,11 @@ async fn scan_similar_images(
         let cancelled = cancel.load(Ordering::Relaxed);
         end_scan(&state, &cancel);
         Ok(SimilarScan {
-            groups,
+            groups: similar.groups,
             cancelled,
             unavailable_roots,
             unreadable_files: unreadable.load(Ordering::Relaxed),
+            too_many_images: similar.too_many_images,
         })
     })
     .await

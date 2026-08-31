@@ -12,6 +12,7 @@ fo-hasher.workspace = true
 rayon = "1"
 image = "0.25"
 image_hasher = "3"
+jpeg-decoder = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
