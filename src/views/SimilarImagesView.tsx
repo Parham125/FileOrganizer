@@ -6,10 +6,25 @@ import type {
   SimilarGroup,
   SimilarScanResult,
 } from "../types";
+import ResultFilters, {
+  NoFilterMatch,
+  useGroupFilter,
+} from "../components/ResultFilters";
 import ScanModePicker from "../components/ScanModePicker";
 import ScanProgress from "../components/ScanProgress";
+import Stack from "../components/Stack";
 import StoppedNotice from "../components/StoppedNotice";
 import { IconCheck, IconFolder } from "../components/icons";
+
+// Stable across filtering, unlike the position a set happens to sit at.
+function keyOf(g: SimilarGroup): string {
+  return g.paths.join("|");
+}
+
+// Defined once so the filter hook can memoize on it.
+function pathsOf(g: SimilarGroup): string[] {
+  return g.paths;
+}
 
 function shortestPath(paths: string[]): string {
   return [...paths].sort(
@@ -33,13 +48,14 @@ export default function SimilarImagesView({
 }) {
   const [root, setRoot] = useState<string | null>(null);
   const [groups, setGroups] = useState<SimilarGroup[] | null>(null);
-  const [selection, setSelection] = useState<Record<number, Set<string>>>({});
+  const [selection, setSelection] = useState<Record<string, Set<string>>>({});
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
+  const filter = useGroupFilter(groups, pathsOf);
 
   useEffect(() => {
     const un = listen<Progress>("similar:progress", (p) => setProgress(p));
@@ -72,8 +88,8 @@ export default function SimilarImagesView({
       });
       setGroups(res.groups);
       setStopped(res.cancelled);
-      const sel: Record<number, Set<string>> = {};
-      res.groups.forEach((g, i) => (sel[i] = defaultRemoval(g.paths)));
+      const sel: Record<string, Set<string>> = {};
+      for (const g of res.groups) sel[keyOf(g)] = defaultRemoval(g.paths);
       setSelection(sel);
     } catch (e) {
       setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -83,33 +99,37 @@ export default function SimilarImagesView({
     }
   }
 
-  function toggle(idx: number, path: string) {
+  function toggle(key: string, path: string) {
     setSelection((prev) => {
-      const next = new Set(prev[idx] ?? []);
+      const next = new Set(prev[key] ?? []);
       if (next.has(path)) next.delete(path);
       else next.add(path);
-      return { ...prev, [idx]: next };
+      return { ...prev, [key]: next };
     });
     setConfirming(false);
     setDone("");
   }
 
+  // Over every loaded set, filtered or not: hiding a set is not deselecting it,
+  // so hidden reports what the filter is covering up.
   const summary = useMemo(() => {
+    const visible = new Set((filter.filtered ?? []).map(keyOf));
     let count = 0;
     let invalid = 0;
-    (groups ?? []).forEach((g, i) => {
-      const rm = selection[i]?.size ?? 0;
+    let hidden = 0;
+    for (const g of groups ?? []) {
+      const rm = selection[keyOf(g)]?.size ?? 0;
       if (rm >= g.paths.length) invalid++;
       count += rm;
-    });
-    return { count, invalid };
-  }, [groups, selection]);
+      if (rm > 0 && !visible.has(keyOf(g))) hidden += rm;
+    }
+    return { count, invalid, hidden };
+  }, [groups, selection, filter.filtered]);
 
   async function trashSelected() {
     const paths: string[] = [];
-    (groups ?? []).forEach((_, i) => {
-      for (const p of selection[i] ?? []) paths.push(p);
-    });
+    for (const g of groups ?? [])
+      for (const p of selection[keyOf(g)] ?? []) paths.push(p);
     if (paths.length === 0) return;
     try {
       await invoke<string>("trash_files", { paths, reason: "dedup" });
@@ -118,8 +138,8 @@ export default function SimilarImagesView({
         .map((g) => ({ ...g, paths: g.paths.filter((p) => !removed.has(p)) }))
         .filter((g) => g.paths.length > 1);
       setGroups(remaining);
-      const sel: Record<number, Set<string>> = {};
-      remaining.forEach((g, i) => (sel[i] = defaultRemoval(g.paths)));
+      const sel: Record<string, Set<string>> = {};
+      for (const g of remaining) sel[keyOf(g)] = defaultRemoval(g.paths);
       setSelection(sel);
       setConfirming(false);
       setDone(
@@ -218,13 +238,19 @@ export default function SimilarImagesView({
             )}
           </div>
 
+          <ResultFilters filter={filter} unit="sets" />
+
+          {(filter.filtered?.length ?? 0) === 0 && (
+            <NoFilterMatch filter={filter} unit="sets" />
+          )}
+
           <div className="space-y-4">
-            {groups.map((g, idx) => {
-              const sel = selection[idx] ?? new Set<string>();
+            {(filter.filtered ?? []).map((g) => {
+              const sel = selection[keyOf(g)] ?? new Set<string>();
               const keeping = g.paths.length - sel.size;
               return (
                 <div
-                  key={g.paths.join("|")}
+                  key={keyOf(g)}
                   className="rounded-lg border border-line bg-surface"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
@@ -271,7 +297,7 @@ export default function SimilarImagesView({
                               <input
                                 type="checkbox"
                                 checked={remove}
-                                onChange={() => toggle(idx, p)}
+                                onChange={() => toggle(keyOf(g), p)}
                                 className="sr-only"
                               />
                               {remove && <IconCheck className="h-3 w-3" />}
@@ -338,6 +364,22 @@ export default function SimilarImagesView({
                     {summary.count}
                   </span>{" "}
                   selected to remove
+                  {summary.hidden > 0 && (
+                    <>
+                      {" · "}
+                      <span className="font-semibold text-ink">
+                        {summary.hidden.toLocaleString()}
+                      </span>{" "}
+                      hidden by the filter
+                      <button
+                        type="button"
+                        onClick={filter.clear}
+                        className="ml-1.5 rounded-[3px] underline decoration-line-strong underline-offset-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                      >
+                        Show all
+                      </button>
+                    </>
+                  )}
                   {summary.invalid > 0 && (
                     <span className="text-brick">
                       {" "}
@@ -360,25 +402,5 @@ export default function SimilarImagesView({
         </div>
       )}
     </div>
-  );
-}
-
-function Stack({ n }: { n: number }) {
-  const layers = Math.min(n, 3);
-  return (
-    <span className="relative block h-9 w-9 shrink-0">
-      {Array.from({ length: layers }).map((_, i) => (
-        <span
-          key={i}
-          className={
-            "absolute h-7 w-6 rounded-[3px] border " +
-            (i === layers - 1
-              ? "border-teal-line bg-teal-soft"
-              : "border-line-strong bg-surface-2")
-          }
-          style={{ left: i * 4, top: i * 3, zIndex: i }}
-        />
-      ))}
-    </span>
   );
 }

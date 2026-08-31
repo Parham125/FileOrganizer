@@ -69,6 +69,12 @@ body,
   height: 100%;
 }
 
+/* The shell owns the viewport; only the main region scrolls. */
+html,
+body {
+  overflow: hidden;
+}
+
 body {
   margin: 0;
   background: var(--paper);

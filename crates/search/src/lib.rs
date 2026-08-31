@@ -247,6 +247,54 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every indexed file, path order, capped at `limit`. Metadata only: the
+    /// name-similarity scan needs paths and sizes for everything, not just the
+    /// size collisions `size_collision_candidates` narrows to.
+    pub fn all_files(&self, limit: i64) -> Result<Vec<FileEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, size, modified_ns FROM files ORDER BY path LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |r| {
+            let path: String = r.get(0)?;
+            let size: i64 = r.get(1)?;
+            let modified_ns: Option<i64> = r.get(2)?;
+            Ok(FileEntry {
+                path: std::path::PathBuf::from(path),
+                size: size.max(0) as u64,
+                modified: modified_ns
+                    .and_then(|ns| u64::try_from(ns).ok())
+                    .map(|ns| UNIX_EPOCH + std::time::Duration::from_nanos(ns)),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Drop any rows that point inside the app's own quarantine. Indexes built
+    /// before quarantine directories were excluded from walking can contain
+    /// trashed files, which resurface in search and pair with their surviving
+    /// originals in a duplicate scan. Returns how many rows were removed.
+    pub fn purge_quarantine_rows(&self, dir_name: &str) -> Result<usize> {
+        let sep = std::path::MAIN_SEPARATOR;
+        let pattern = format!(
+            "%{}{}{}%",
+            sep,
+            dir_name
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_"),
+            sep
+        );
+        let n = self.conn.execute(
+            "DELETE FROM files WHERE path LIKE ?1 ESCAPE '\\'",
+            [&pattern],
+        )?;
+        self.conn.execute(
+            "DELETE FROM content_fts WHERE path LIKE ?1 ESCAPE '\\'",
+            [&pattern],
+        )?;
+        Ok(n)
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.conn
             .execute_batch("DELETE FROM files; DELETE FROM content_fts; DELETE FROM roots;")?;

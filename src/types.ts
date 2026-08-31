@@ -23,6 +23,32 @@ export type SimilarGroup = {
   distance: number;
 };
 
+// How two names were judged to belong together. "copies" strips copy markers
+// and keeps the extension, "media" strips quality tags and ignores it.
+export type NameStrategy = "copies" | "media";
+
+// One file inside a name group. marker is what made it look like a copy, and
+// stripped lists the tokens the media strategy removed to reach the title.
+export type NameMatch = {
+  path: string;
+  size: number;
+  modified_ns: number | null;
+  marker: string | null;
+  stripped?: string[];
+};
+
+// Files whose names collapse to the same stem. Nothing here was hashed, so a
+// group is a lead and not a proof: all_same_size is the only hint that the
+// files might really hold the same bytes.
+export type NameGroup = {
+  strategy: string;
+  stem: string;
+  ext: string;
+  year?: number | null;
+  files: NameMatch[];
+  all_same_size: boolean;
+};
+
 // How aggressively a scan reads the disk. "sequential" reads one file at a
 // time, which suits external and spinning drives.
 export type ScanMode = "auto" | "sequential";
@@ -37,6 +63,11 @@ export type DupScanResult = {
   cancelled: boolean;
 };
 export type SimilarScanResult = { groups: SimilarGroup[]; cancelled: boolean };
+export type NameScanResult = {
+  group_count: number;
+  groups: NameGroup[];
+  cancelled: boolean;
+};
 export type IndexResult = { count: number; cancelled: boolean };
 
 export type ContentHit = {

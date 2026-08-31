@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod names;
 mod similar;
+pub use names::{find_similar_names, NameGroup, NameMatch, NameStrategy};
 pub use similar::{find_similar_images, perceptual_hash, SimilarGroup};
 
 const PARTIAL_BYTES: usize = 8192;

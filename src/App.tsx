@@ -28,7 +28,7 @@ export default function App() {
   const goSettings = () => setView("settings");
 
   return (
-    <div className="flex h-full flex-col bg-paper text-ink md:flex-row">
+    <div className="flex h-dvh flex-col overflow-hidden bg-paper text-ink md:flex-row">
       <Sidebar
         view={view}
         onView={setView}
@@ -36,7 +36,10 @@ export default function App() {
         isDark={isDark}
         onToggleTheme={() => setTheme(isDark ? "light" : "dark")}
       />
-      <main className="min-w-0 flex-1 overflow-y-auto">
+      {/* relative: sr-only inputs in the views are position:absolute, and without a
+          positioned ancestor they resolve against the page and drag the whole shell,
+          sidebar included, into the document scroll. */}
+      <main className="relative min-h-0 min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-3xl px-5 py-6 md:px-8 md:py-9">
           {view === "search" && (
             <SearchView indexed={indexed} onIndexed={setIndexed} />

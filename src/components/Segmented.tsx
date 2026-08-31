@@ -13,7 +13,7 @@ export default function Segmented<T extends string>({
     <div
       role="radiogroup"
       aria-label={ariaLabel}
-      className="inline-flex rounded-md border border-line bg-surface-2 p-1"
+      className="inline-flex flex-wrap rounded-md border border-line bg-surface-2 p-1"
     >
       {options.map((o) => {
         const active = o.value === value;

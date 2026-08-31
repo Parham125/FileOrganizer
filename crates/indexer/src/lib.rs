@@ -2,6 +2,7 @@ use anyhow::Result;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
@@ -17,13 +18,44 @@ pub trait FileSource {
     fn enumerate(&self, root: &Path) -> Result<Vec<FileEntry>>;
 }
 
+/// The app's own per-volume quarantine. Walking into it would re-discover every
+/// file the user has trashed: they would come back in search results, and a
+/// duplicate scan would pair a surviving file with its own trashed copy and
+/// report it as a duplicate all over again.
+pub const QUARANTINE_DIR: &str = ".FileOrganizer-Trash";
+
+/// Extra directories to skip, set once at startup (the app data dir, which holds
+/// the fallback quarantine and the databases).
+static EXCLUDED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Register directories that enumeration must never descend into. Call once,
+/// before any indexing; later calls are ignored.
+pub fn set_excluded_roots(roots: Vec<PathBuf>) {
+    let _ = EXCLUDED.set(roots);
+}
+
+fn is_excluded(path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_some_and(|n| n == std::ffi::OsStr::new(QUARANTINE_DIR))
+    {
+        return true;
+    }
+    EXCLUDED
+        .get()
+        .is_some_and(|roots| roots.iter().any(|r| path.starts_with(r)))
+}
+
 /// Cross-platform recursive walker backed by the `walkdir` crate.
 pub struct WalkdirSource;
 
 impl FileSource for WalkdirSource {
     fn enumerate(&self, root: &Path) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let walk = WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| !(e.file_type().is_dir() && is_excluded(e.path())));
+        for entry in walk.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -118,5 +150,27 @@ impl Watcher {
             })?;
         watcher.watch(path, RecursiveMode::Recursive)?;
         Ok(Watcher { inner: watcher })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn walking_skips_the_apps_own_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("photo.jpg");
+        fs::write(&keep, b"same bytes").unwrap();
+        // a trashed copy, exactly where the per-volume quarantine puts it
+        let quarantine = dir.path().join(QUARANTINE_DIR).join("op1");
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(quarantine.join("abc_photo.jpg"), b"same bytes").unwrap();
+        let entries = WalkdirSource.enumerate(dir.path()).unwrap();
+        // without the skip these two identical files pair up and the file the
+        // user already trashed is offered to them as a duplicate again
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, keep);
     }
 }

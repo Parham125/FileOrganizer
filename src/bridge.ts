@@ -11,6 +11,9 @@ import type {
   IndexResult,
   KeyStorage,
   Move,
+  NameGroup,
+  NameScanResult,
+  NameStrategy,
   PendingAction,
   Progress,
   QuestionAnswer,
@@ -250,6 +253,91 @@ function makeDupGroups(): DupGroup[] {
   return groups;
 }
 
+// The indexed scan reads every folder the user added, so its sets straddle
+// drives: the working copy on the system drive, the archived copy on whatever
+// external volume was indexed. Sizes are spread on purpose so a size floor
+// visibly changes how much comes back.
+function makeIndexedDupGroups(): DupGroup[] {
+  const groups: DupGroup[] = [
+    {
+      hash: "b4d1907ac6e35f82",
+      size: 22_400_000,
+      paths: [
+        "/Users/you/Archive/photos/scan-0001.tiff",
+        "/Volumes/Archive/scans/1998/scan-0001.tiff",
+        "/Volumes/Archive/scans/negatives/scan-0001.tiff",
+      ],
+    },
+    {
+      hash: "0f72c8ad5b31e604",
+      size: 1_240_000_000,
+      paths: [
+        "/Users/you/Desktop/meeting recording.mov",
+        "/Volumes/Archive/media/renders/meeting recording.mov",
+      ],
+    },
+    {
+      hash: "9ac4e1f80d27b553",
+      size: 8_900_000,
+      paths: [
+        "/Users/you/Pictures/2026/reykjavik-0433.jpg",
+        "/Volumes/Archive/media/2026/reykjavik-0433.jpg",
+        "/Users/you/Pictures/exports/reykjavik-0433.jpg",
+      ],
+    },
+    {
+      hash: "5e60b3c92f814a7d",
+      size: 214_000,
+      paths: [
+        "/Users/you/Documents/Invoices/invoice-2214.pdf",
+        "/Volumes/Archive/scans/2019/invoice-2214.pdf",
+      ],
+    },
+  ];
+  const stems: [string, string, number][] = [
+    ["logo-mark", "svg", 18_400],
+    ["schema", "sql", 24_500],
+    ["invoice", "pdf", 214_000],
+    ["lease", "pdf", 920_000],
+    ["headshot", "png", 3_400_000],
+    ["ridge", "jpg", 5_100_000],
+    ["reykjavik", "jpg", 8_900_000],
+    ["scan", "tiff", 22_400_000],
+    ["first-take", "wav", 41_300_000],
+    ["board-deck", "key", 48_200_000],
+    ["dataset", "csv", 88_500_000],
+    ["dump-2026-07", "sql", 340_000_000],
+    ["mixdown", "wav", 1_100_000_000],
+    ["drone", "mp4", 1_900_000_000],
+  ];
+  const folders = [
+    "/Users/you/Documents/Scans",
+    "/Users/you/Pictures/2026",
+    "/Users/you/Pictures/exports",
+    "/Users/you/Music/demos",
+    "/Volumes/Archive/scans/2019",
+    "/Volumes/Archive/scans/negatives",
+    "/Volumes/Archive/media/renders",
+    "/Volumes/Archive/media/2026",
+  ];
+  for (let i = 0; i < 116; i++) {
+    const [stem, ext, size] = stems[i % stems.length];
+    const copies = 2 + (i % 3);
+    groups.push({
+      hash: rid().slice(0, 16),
+      size,
+      // Offsetting the second copy by four lands it on the other side of the
+      // folder list, so most sets span the system drive and the volume.
+      paths: Array.from(
+        { length: copies },
+        (_, c) =>
+          `${folders[(i + c * 4 + 1) % folders.length]}/${stem}-${1000 + i}${c === 0 ? "" : c === 1 ? " copy" : ` copy ${c}`}.${ext}`,
+      ),
+    });
+  }
+  return groups;
+}
+
 function makeSimilarGroups(): SimilarGroup[] {
   return [
     {
@@ -268,6 +356,202 @@ function makeSimilarGroups(): SimilarGroup[] {
       ],
     },
   ];
+}
+
+// Name matching returns leads, not proof, so the mock has to carry the two
+// shapes the reader judges: copies that usually weigh the same, and one title
+// held at qualities that weigh wildly different amounts.
+function makeCopyGroups(): NameGroup[] {
+  const stems: [string, string, number][] = [
+    ["invoice", "pdf", 214_000],
+    ["board deck", "key", 48_200_000],
+    ["lease", "pdf", 920_000],
+    ["headshot", "png", 3_400_000],
+    ["dataset", "csv", 88_500_000],
+    ["schema", "sql", 24_500],
+    ["reykjavik-0431", "jpg", 8_900_000],
+    ["first-take", "wav", 41_300_000],
+    ["standup notes", "txt", 4_200],
+    ["logo-mark", "svg", 18_400],
+    ["site-backup", "zip", 642_000_000],
+    ["podcast-ep12", "mp3", 52_400_000],
+  ];
+  const folders = [
+    "/Users/you/Downloads",
+    "/Users/you/Desktop",
+    "/Users/you/Documents/Scans",
+    "/Users/you/Pictures/2026",
+    "/Users/you/Archive/2019",
+    "/Volumes/Archive/scans",
+  ];
+  const markers = ["(1)", "copy", "2", "copy 2", "(3)"];
+  const groups: NameGroup[] = [
+    {
+      strategy: "copies",
+      stem: "invoice",
+      ext: "pdf",
+      year: null,
+      all_same_size: true,
+      files: [
+        {
+          path: "/Users/you/Documents/Invoices/invoice.pdf",
+          size: 214_000,
+          modified_ns: daysAgoNs(240),
+          marker: null,
+          stripped: [],
+        },
+        {
+          path: "/Users/you/Downloads/invoice (1).pdf",
+          size: 214_000,
+          modified_ns: daysAgoNs(238),
+          marker: "(1)",
+          stripped: [],
+        },
+        {
+          path: "/Users/you/Desktop/invoice copy.pdf",
+          size: 214_000,
+          modified_ns: daysAgoNs(96),
+          marker: "copy",
+          stripped: [],
+        },
+      ],
+    },
+  ];
+  for (let i = 0; i < 41; i++) {
+    const [stem, ext, size] = stems[i % stems.length];
+    const name = `${stem}-${1000 + i}`;
+    const copies = 2 + (i % 2);
+    // Every third set holds a copy that grew or shrank, which is exactly the
+    // case where a name match is not a content match.
+    const drift = i % 3 === 0;
+    const files = Array.from({ length: copies }, (_, c) => ({
+      path: `${folders[(i + c * 2) % folders.length]}/${name}${c === 0 ? "" : ` ${markers[(i + c) % markers.length]}`}.${ext}`,
+      size: c === 0 || !drift ? size : Math.round(size * (c === 1 ? 0.62 : 1.4)),
+      modified_ns: daysAgoNs(12 + i * 3 + c * 9),
+      marker: c === 0 ? null : markers[(i + c) % markers.length],
+      stripped: [],
+    }));
+    groups.push({
+      strategy: "copies",
+      stem: name,
+      ext,
+      year: null,
+      all_same_size: files.every((f) => f.size === files[0].size),
+      files,
+    });
+  }
+  return groups;
+}
+
+function makeMediaGroups(): NameGroup[] {
+  const films: [string, number, number][] = [
+    ["Inception", 2010, 1_040_000_000],
+    ["Arrival", 2016, 980_000_000],
+    ["Dune", 2021, 1_320_000_000],
+    ["Whiplash", 2014, 870_000_000],
+    ["Parasite", 2019, 1_180_000_000],
+    ["Heat", 1995, 1_460_000_000],
+    ["The Thing", 1982, 790_000_000],
+    ["Mad Max Fury Road", 2015, 1_290_000_000],
+    ["Interstellar", 2014, 1_510_000_000],
+    ["Ex Machina", 2014, 840_000_000],
+    ["Sicario", 2015, 910_000_000],
+    ["Drive", 2011, 760_000_000],
+    ["Prisoners", 2013, 1_120_000_000],
+    ["Her", 2013, 880_000_000],
+    ["Moon", 2009, 720_000_000],
+    ["Annihilation", 2018, 1_060_000_000],
+    ["Gravity", 2013, 830_000_000],
+    ["Spider-Man Into the Spider-Verse", 2018, 1_240_000_000],
+    ["No Country for Old Men", 2007, 1_010_000_000],
+    ["The Social Network", 2010, 940_000_000],
+    ["Children of Men", 2006, 890_000_000],
+    ["Under the Skin", 2013, 700_000_000],
+    ["The Master", 2012, 1_150_000_000],
+    ["Nightcrawler", 2014, 860_000_000],
+    ["Hell or High Water", 2016, 780_000_000],
+    ["Wind River", 2017, 810_000_000],
+    ["Enemy", 2013, 690_000_000],
+    ["Coherence", 2013, 640_000_000],
+    ["Primer", 2004, 520_000_000],
+    ["The Lighthouse", 2019, 950_000_000],
+    ["First Reformed", 2017, 830_000_000],
+    ["Burning", 2018, 1_090_000_000],
+    ["Roma", 2018, 1_270_000_000],
+    ["Mandy", 2018, 970_000_000],
+    ["Uncut Gems", 2019, 1_140_000_000],
+    ["Good Time", 2017, 800_000_000],
+  ];
+  const albums: [string, number][] = [
+    ["Kind of Blue", 46_800_000],
+    ["Blue Train", 51_200_000],
+    ["Selected Ambient Works", 68_400_000],
+    ["Music Has the Right to Children", 74_100_000],
+  ];
+  const groups: NameGroup[] = [];
+  films.forEach(([title, year, base], i) => {
+    const dot = title.replace(/[\s]/g, ".");
+    const dash = title.toLowerCase().replace(/\s/g, "-");
+    const files: NameGroup["files"] = [
+      {
+        path: `/Volumes/Archive/Movies/${dot}.${year}.720p.BluRay.x264-GRP.mp4`,
+        size: base,
+        modified_ns: daysAgoNs(300 + i * 11),
+        marker: "720p",
+        stripped: ["720p", "bluray", "x264", "grp", String(year)],
+      },
+      {
+        path: `/Users/you/Movies/${dash}-${year}-1080p-web-dl.mkv`,
+        size: Math.round(base * 6.4),
+        modified_ns: daysAgoNs(40 + i * 5),
+        marker: "1080p",
+        stripped: ["1080p", "web-dl", String(year)],
+      },
+    ];
+    if (i % 3 === 0)
+      files.push({
+        path: `/Volumes/Archive/Movies/remux/${dot}.${year}.2160p.UHD.REMUX.HDR.mkv`,
+        size: Math.round(base * 34),
+        modified_ns: daysAgoNs(18 + i * 4),
+        marker: "2160p",
+        stripped: ["2160p", "uhd", "remux", "hdr", String(year)],
+      });
+    groups.push({
+      strategy: "media",
+      stem: title.toLowerCase().replace(/-/g, " "),
+      ext: "",
+      year,
+      all_same_size: false,
+      files,
+    });
+  });
+  albums.forEach(([title, base], i) => {
+    const dash = title.toLowerCase().replace(/\s/g, "-");
+    groups.push({
+      strategy: "media",
+      stem: title.toLowerCase(),
+      ext: "",
+      year: null,
+      all_same_size: false,
+      files: [
+        {
+          path: `/Users/you/Music/lossless/${dash}.flac`,
+          size: Math.round(base * 6.1),
+          modified_ns: daysAgoNs(120 + i * 8),
+          marker: null,
+          stripped: ["flac"],
+        },
+        {
+          path: `/Users/you/Music/phone/${dash}-320.mp3`,
+          size: base,
+          modified_ns: daysAgoNs(60 + i * 8),
+          marker: null,
+          stripped: ["mp3"],
+        },
+      ],
+    });
+  });
+  return groups;
 }
 
 function makeContentHits(query: string): ContentHit[] {
@@ -776,6 +1060,25 @@ function mockBridge(): Bridge {
           cancelled,
         } as DupScanResult as T;
       }
+      case "scan_duplicates_indexed": {
+        // No walk here: it reads the index, so the total is every indexed row.
+        const slow = args.mode === "sequential";
+        const cancelled = await ramp(
+          "dedup:progress",
+          indexed,
+          slow ? 3400 : 2600,
+        );
+        const floor = Number(args.minSize ?? 1);
+        const all = makeIndexedDupGroups().filter((g) => g.size >= floor);
+        const groups = cancelled
+          ? all.slice(0, Math.ceil(all.length / 3))
+          : all;
+        return {
+          group_count: groups.length,
+          groups,
+          cancelled,
+        } as DupScanResult as T;
+      }
       case "scan_similar_images": {
         const slow = args.mode === "sequential";
         const cancelled = await ramp(
@@ -788,6 +1091,24 @@ function mockBridge(): Bridge {
           groups: cancelled ? all.slice(0, 1) : all,
           cancelled,
         } as SimilarScanResult as T;
+      }
+      case "scan_similar_names": {
+        // Names come from the index, so the total is rows read, not bytes.
+        const slow = args.mode === "sequential";
+        const strategy = (args.strategy ?? "copies") as NameStrategy;
+        const cancelled = await ramp(
+          "names:progress",
+          args.root ? 6_400 : indexed,
+          slow ? 3200 : 2400,
+        );
+        const all =
+          strategy === "media" ? makeMediaGroups() : makeCopyGroups();
+        const groups = cancelled ? all.slice(0, Math.ceil(all.length / 3)) : all;
+        return {
+          group_count: groups.length,
+          groups,
+          cancelled,
+        } as NameScanResult as T;
       }
       case "index_content": {
         const cancelled = await ramp("content:progress", 612, 2600);

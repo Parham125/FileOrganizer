@@ -42,7 +42,7 @@ export default function Sidebar({
   onToggleTheme: () => void;
 }) {
   return (
-    <aside className="flex shrink-0 flex-row items-stretch gap-1 border-b border-line bg-surface-2 px-2 py-2 md:w-56 md:flex-col md:gap-0.5 md:border-b-0 md:border-r md:px-3 md:py-4">
+    <aside className="flex shrink-0 flex-row items-stretch gap-1 border-b border-line bg-surface-2 px-2 py-2 md:w-56 md:flex-col md:gap-0.5 md:overflow-hidden md:border-b-0 md:border-r md:px-3 md:py-4">
       <div className="mr-2 hidden items-center gap-2 px-2 pb-4 md:flex">
         <Logo className="h-7 w-7" />
         <span className="text-[15px] font-semibold tracking-tight">
@@ -50,7 +50,9 @@ export default function Sidebar({
         </span>
       </div>
 
-      <nav className="flex flex-1 flex-row gap-1 md:flex-col md:gap-0.5">
+      {/* Scrolls on its own at short viewports so the footer below stays pinned.
+          The inset padding keeps focus rings clear of the scroll container's edge. */}
+      <nav className="flex flex-1 flex-row gap-1 md:-mx-1 md:min-h-0 md:flex-col md:gap-0.5 md:overflow-y-auto md:px-1">
         {NAV.map(({ id, label, Icon }) => {
           const active = view === id;
           return (

@@ -2,7 +2,10 @@ use fo_ai::organize::{self, Move};
 use fo_ai::{OpenRouter, ReasoningEffort};
 use fo_archive::ArchiveListing;
 use fo_chats::{derive_title, Chat, ChatSummary, Chats};
-use fo_dedup::{find_duplicates, find_similar_images, DupGroup, ScanMode, SimilarGroup};
+use fo_dedup::{
+    find_duplicates, find_similar_images, find_similar_names, DupGroup, NameGroup, NameStrategy,
+    ScanMode, SimilarGroup,
+};
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
 use fo_rules::{match_rule, Rule, RuleAction, RuleFilter, Rules};
@@ -112,6 +115,15 @@ struct DupScan {
 #[derive(serde::Serialize)]
 struct SimilarScan {
     groups: Vec<SimilarGroup>,
+    cancelled: bool,
+}
+
+/// A name-similarity scan. Same `cancelled` contract as `DupScan`. These files
+/// share a NAME, not necessarily contents: nothing here was hashed.
+#[derive(serde::Serialize)]
+struct NameScan {
+    group_count: usize,
+    groups: Vec<NameGroup>,
     cancelled: bool,
 }
 
@@ -633,6 +645,65 @@ async fn scan_similar_images(
         let cancelled = cancel.load(Ordering::Relaxed);
         end_scan(&state, &cancel);
         Ok(SimilarScan { groups, cancelled })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// How many indexed rows the name scan pulls when no root is given. Matches the
+/// cap inside `find_similar_names`, so the walk and the index path behave alike.
+const NAME_SCAN_CAP: i64 = 100_000;
+
+/// Files whose names differ only by a copy marker ("invoice (1).pdf" beside
+/// "invoice.pdf"), or, with `strategy: "media"`, the same title held at several
+/// qualities ("Inception.2010.1080p.mkv" beside "inception 720p.mp4").
+///
+/// `root` walks one folder; leaving it out uses every indexed file, so it covers
+/// all indexed drives like `scan_duplicates_indexed`. Nothing is hashed: a match
+/// means the names line up, NOT that the contents do.
+#[tauri::command]
+async fn scan_similar_names(
+    root: Option<String>,
+    strategy: Option<String>,
+    mode: Option<String>,
+    app: AppHandle,
+) -> Result<NameScan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // `mode` is accepted for symmetry with the other scans; this pass reads
+        // no file contents, so there is no reader concurrency to tune.
+        let _ = mode;
+        let strategy = NameStrategy::from_label(strategy.as_deref());
+        let state = app.state::<AppState>();
+        let entries = match root {
+            Some(r) => WalkdirSource
+                .enumerate(&PathBuf::from(&r))
+                .map_err(|e| e.to_string())?,
+            None => {
+                let idx = state.index.lock().unwrap();
+                idx.all_files(NAME_SCAN_CAP).map_err(|e| e.to_string())?
+            }
+        };
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
+        let total = entries.len();
+        if throttle.ready(0, total) {
+            let _ = app.emit(
+                "names:progress",
+                serde_json::json!({ "done": 0, "total": total }),
+            );
+        }
+        let groups = find_similar_names(&entries, strategy, &cancel);
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        let _ = app.emit(
+            "names:progress",
+            serde_json::json!({ "done": total, "total": total }),
+        );
+        Ok(NameScan {
+            group_count: groups.len(),
+            groups,
+            cancelled,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1240,6 +1311,10 @@ pub fn run() {
             fs::create_dir_all(&dir)?;
             let _ = SETTINGS_PATH.set(dir.join("settings.json"));
             let _ = CREDENTIALS_PATH.set(dir.join("credentials.json"));
+            // Never walk our own storage: the fallback quarantine lives here, and
+            // indexing it would resurrect trashed files in search and pair them
+            // with their surviving originals as "duplicates".
+            fo_indexer::set_excluded_roots(vec![dir.clone()]);
             let index = Index::open(&dir.join("index.db"))?;
             let trash = Trash::open(&dir)?;
             let rules = Rules::open(&dir)?;
@@ -1252,9 +1327,18 @@ pub fn run() {
                 watchers: Mutex::new(HashMap::new()),
                 scan_cancel: Mutex::new(None),
             });
+            let handle = app.handle().clone();
+            // One-time repair: an index built before quarantines were excluded
+            // still lists trashed files, which show up in search and as their
+            // own duplicates.
+            {
+                let idx = handle.state::<AppState>();
+                let idx = idx.index.lock().unwrap();
+                let _ = idx.purge_quarantine_rows(fo_indexer::QUARANTINE_DIR);
+                let _ = idx.remove_under(&dir);
+            }
             // Watchers do not survive a restart, so without this the index goes
             // quietly stale until the user re-indexes by hand.
-            let handle = app.handle().clone();
             let roots = handle
                 .state::<AppState>()
                 .index
@@ -1283,6 +1367,7 @@ pub fn run() {
             scan_duplicates,
             scan_duplicates_indexed,
             scan_similar_images,
+            scan_similar_names,
             cancel_scan,
             trash_files,
             list_trash,

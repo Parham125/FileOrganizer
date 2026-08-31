@@ -26,10 +26,12 @@
 ### Windows
 Grab the latest installer from the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page:
 
-- **`FileOrganizer_x64-setup.exe`** (NSIS installer), or
-- **`FileOrganizer_x64_en-US.msi`** (MSI)
+- **`FileOrganizer_x64-setup.exe`** (recommended), or
+- **`FileOrganizer_x64_en-US.msi`**
 
-Both are built from source by GitHub Actions on every release tag. The app is not code-signed yet, so SmartScreen may warn on first run. Choose **More info -> Run anyway**.
+**Pick one format and keep updating with that one.** The two are different installer technologies that register separately, so installing with the MSI and then running the `.exe` leaves you with two installations rather than an update. Your data is shared either way, since it lives outside the install folder. The `.exe` is recommended because its uninstaller offers to remove the app's data and warns about files still sitting in the app's Trash; the MSI has no equivalent. To switch, uninstall the old one first.
+
+Both are built from source by GitHub Actions on every release tag. The app is not code-signed, so SmartScreen warns on first run. Choose **More info -> Run anyway**.
 
 ### macOS
 No signed build yet. [Build it from source](#develop) (one command), or open the locally built `.dmg`. On first open, right-click the app and choose **Open** to get past Gatekeeper.
@@ -43,6 +45,8 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 ♻️ **Deduplicator.** A staged pipeline (group by size, then a partial hash, then a full content hash) finds byte-for-byte duplicates without hashing everything. Parallel hashing, grouped by wasted space, safe copies preselected. BLAKE3 by default, SHA-256 optional.
 
 🖼️ **Near-duplicate images.** Beyond exact copies, it finds photos that look the same (resaved, resized, lightly edited) using perceptual hashing, so you can clear out visual dupes too.
+
+🏷️ **Similar names.** Finds a copy sitting next to its original (`invoice (1).pdf`), and one movie kept at two qualities (`Inception.2010.720p.mp4` beside `inception 1080p.mkv`, container ignored). Sequels and remakes are deliberately kept apart. Nothing here is hashed, so nothing is preselected: it shows you the sizes, the dates and why each file matched, and you decide.
 
 📄 **Search inside documents.** Index a folder once and full-text search the text inside your files: plain text, code, PDF, and DOCX.
 

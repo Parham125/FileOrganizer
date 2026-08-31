@@ -2,7 +2,7 @@ use crate::{stat_entries, AppState};
 use anyhow::{anyhow, Result};
 use fo_ai::OpenRouter;
 use fo_archive::list_archive;
-use fo_dedup::{find_duplicates, ScanMode};
+use fo_dedup::{find_duplicates, find_similar_names, NameStrategy, ScanMode};
 use fo_hasher::HashAlgo;
 use fo_indexer::{FileSource, WalkdirSource};
 use fo_rules::{match_rule, RuleAction, RuleFilter, Rules};
@@ -133,6 +133,16 @@ fn tools() -> Value {
             "description": "Find groups of identical files under a folder. Returns hash, size, wasted bytes and paths per group, biggest waste first. Results are paged: one call returns at most `limit` groups (default 20, max 50) starting at `offset`, while `group_count` is always the true number of groups found. If has_more is true, call again with offset raised by the number returned; do not retry with a larger limit.",
             "parameters": {"type": "object", "properties": {
                 "root": {"type": "string", "description": "Absolute folder path to scan."},
+                "limit": {"type": "integer", "description": "Page size (default 20, max 50)."},
+                "offset": {"type": "integer", "description": "How many groups to skip (default 0). Use it to read the next page."}
+            }, "required": ["root"]}
+        }},
+        {"type": "function", "function": {
+            "name": "find_similar_names",
+            "description": "Find groups of files whose NAMES look like copies of each other under a folder. This reads no file contents, so a group means the names line up, NOT that the files are identical; check size and all_same_size before suggesting anything be deleted. strategy \"copies\" (the default) groups files that differ only by a copy marker, like invoice.pdf / invoice (1).pdf / invoice copy.pdf / IMG_1234 2.jpg, and only within one extension. strategy \"media\" groups the same movie or track held at several qualities, like Inception.2010.720p.BluRay.x264-GRP.mp4 / inception 1080p.mkv, ignoring the container but never mixing video with audio and never merging two films with different years; each file lists the tokens that were stripped so you can explain the match. Results are paged: one call returns at most `limit` groups (default 20, max 50) starting at `offset`, while `group_count` is always the true number of groups found. If has_more is true, call again with offset raised by the number returned; do not retry with a larger limit.",
+            "parameters": {"type": "object", "properties": {
+                "root": {"type": "string", "description": "Absolute folder path to scan."},
+                "strategy": {"type": "string", "enum": ["copies", "media"], "description": "\"copies\" for copy markers (default), \"media\" for the same title at different qualities."},
                 "limit": {"type": "integer", "description": "Page size (default 20, max 50)."},
                 "offset": {"type": "integer", "description": "How many groups to skip (default 0). Use it to read the next page."}
             }, "required": ["root"]}
@@ -473,6 +483,61 @@ fn run_read_tool(name: &str, args: &Value, index: &Index, rules: &Rules) -> Resu
                         "size": g.size,
                         "wasted": g.size * (g.paths.len() as u64 - 1),
                         "paths": g.paths.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "group_count": groups.len(),
+                "offset": offset,
+                "returned": page.len(),
+                "has_more": offset + page.len() < groups.len(),
+                "groups": page
+            }))
+        }
+        "find_similar_names" => {
+            let root = args["root"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing root"))?;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(DUP_PAGE_DEFAULT)
+                .clamp(1, DUP_PAGE_MAX) as usize;
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            let strategy = NameStrategy::from_label(args["strategy"].as_str());
+            let entries = WalkdirSource.enumerate(Path::new(root))?;
+            let mut groups = find_similar_names(&entries, strategy, &AtomicBool::new(false));
+            // paging is only stable if the order is total: most files first, then
+            // stem, year and first path so equal-sized groups never swap
+            groups.sort_by(|a, b| {
+                b.files
+                    .len()
+                    .cmp(&a.files.len())
+                    .then_with(|| a.stem.cmp(&b.stem))
+                    .then_with(|| a.year.cmp(&b.year))
+                    .then_with(|| a.ext.cmp(&b.ext))
+                    .then_with(|| {
+                        a.files
+                            .first()
+                            .map(|f| &f.path)
+                            .cmp(&b.files.first().map(|f| &f.path))
+                    })
+            });
+            let page: Vec<Value> = groups
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|g| {
+                    json!({
+                        "stem": g.stem,
+                        "ext": g.ext,
+                        "year": g.year,
+                        "all_same_size": g.all_same_size,
+                        "files": g.files.iter().map(|f| json!({
+                            "path": f.path.to_string_lossy().to_string(),
+                            "size": f.size,
+                            "marker": f.marker,
+                            "stripped": f.stripped
+                        })).collect::<Vec<_>>()
                     })
                 })
                 .collect();
@@ -1123,6 +1188,7 @@ mod tests {
             "search_files",
             "list_folder",
             "find_duplicates",
+            "find_similar_names",
             "index_stats",
             "storage_stats",
             "list_rules",
@@ -1380,6 +1446,58 @@ mod tests {
         .unwrap();
         assert_eq!(all["returned"].as_u64(), Some(5));
         assert_eq!(all["has_more"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn find_similar_names_pages_and_honours_the_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("names");
+        fs::create_dir_all(&src).unwrap();
+        for stem in ["alpha", "beta", "gamma"] {
+            fs::write(src.join(format!("{}.txt", stem)), b"x").unwrap();
+            fs::write(src.join(format!("{} copy.txt", stem)), b"x").unwrap();
+        }
+        fs::write(src.join("Inception.2010.720p.BluRay.x264-GRP.mp4"), b"x").unwrap();
+        fs::write(src.join("inception 1080p.mkv"), b"xx").unwrap();
+        let index = Index::open(&dir.path().join("index.db")).unwrap();
+        let rules = Rules::open(dir.path()).unwrap();
+        let call =
+            |args: Value| execute_read_tool("find_similar_names", &args, &index, &rules).unwrap();
+        let root = src.to_str().unwrap();
+        let all = call(json!({"root": root}));
+        assert_eq!(
+            all["group_count"].as_u64(),
+            Some(3),
+            "copies is the default"
+        );
+        assert_eq!(all["has_more"].as_bool(), Some(false));
+        let stems: Vec<&str> = all["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["stem"].as_str().unwrap())
+            .collect();
+        assert_eq!(stems, vec!["alpha", "beta", "gamma"]);
+        // the media pair has two extensions, so the copies strategy must miss it
+        assert!(!stems.contains(&"inception"));
+        let p0 = call(json!({"root": root, "limit": 2}));
+        assert_eq!(p0["returned"].as_u64(), Some(2));
+        assert_eq!(p0["has_more"].as_bool(), Some(true));
+        let p1 = call(json!({"root": root, "limit": 2, "offset": 2}));
+        assert_eq!(p1["returned"].as_u64(), Some(1));
+        assert_eq!(p1["has_more"].as_bool(), Some(false));
+        assert_eq!(p1["groups"][0]["stem"].as_str(), Some("gamma"));
+        let media = call(json!({"root": root, "strategy": "media"}));
+        assert_eq!(media["group_count"].as_u64(), Some(1));
+        let g = &media["groups"][0];
+        assert_eq!(g["stem"].as_str(), Some("inception"));
+        assert_eq!(g["year"].as_u64(), Some(2010));
+        assert_eq!(g["all_same_size"].as_bool(), Some(false));
+        assert!(g["files"][0]["stripped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str() == Some("720p")));
     }
 
     #[test]

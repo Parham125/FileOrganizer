@@ -38,6 +38,12 @@ export function useScanMode(): [ScanMode, (m: ScanMode) => void] {
   return useLocalStorageState<ScanMode>("fo.scanMode", "auto");
 }
 
+// Floor for the indexed duplicate scan, in MB. Tiny files repeat across every
+// drive and produce sets that free almost nothing, so the user sets this once.
+export function useDupMinMb(): [number, (m: number) => void] {
+  return useLocalStorageState<number>("fo.dupMinMb", 1);
+}
+
 export function useTheme(): [Theme, (t: Theme) => void, boolean] {
   const [theme, setTheme] = useLocalStorageState<Theme>("fo.theme", "system");
   const [isDark, setIsDark] = useState(false);
