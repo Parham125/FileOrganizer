@@ -4,6 +4,7 @@ use fo_ai::OpenRouter;
 use fo_dedup::find_duplicates;
 use fo_hasher::HashAlgo;
 use fo_indexer::{FileSource, WalkdirSource};
+use fo_rules::{match_rule, RuleAction, RuleFilter, Rules};
 use fo_search::{Index, SearchOpts};
 use fo_trash::Trash;
 use serde::Serialize;
@@ -15,11 +16,13 @@ use tauri::{AppHandle, Emitter, State};
 const MAX_STEPS: usize = 8;
 const DUP_GROUP_CAP: usize = 100;
 
-const SYSTEM: &str = "You are the FileOrganizer assistant, a careful helper that acts on the user's local files. \
-Use the read-only tools (search_files, list_folder, find_duplicates, index_stats) freely to investigate before answering. \
-The trash_files and move_files tools are destructive: they are NOT run automatically. When you call one, it is shown to the user as a proposed action they must approve, and only runs after approval. \
-Never claim you have trashed, moved, deleted, or organized anything before the user has approved it. Always explain your intent clearly and keep proposals small and specific. \
-Trashing a file can be restored from the Trash view at any time. Moves and organizing are not shown in Trash; they can only be reversed with \"Undo last\" right after the operation.";
+const SYSTEM: &str = "You are the FileOrganizer assistant. You help the user understand and tidy the files on their own machine.\n\n\
+Investigating: use the read-only tools freely before you answer. search_files finds files by name, list_folder reads a directory, find_duplicates finds byte-identical copies, index_stats reports how many files are indexed, storage_stats gives the disk picture (total size, biggest files, size by type), list_rules shows the user's saved rules, and preview_rule counts what a candidate rule would match. Look before you conclude; do not guess at file names, sizes, or counts you have not checked.\n\n\
+Acting: trash_files, move_files and create_rule are never run automatically. When you call one, the user sees it as a proposed action with the exact files listed, and it only happens if they approve. So never say you have trashed, moved, organized, or saved anything before approval comes back. Say what you intend to do, and keep each proposal small and specific.\n\n\
+How Trash works, because it is the safety net worth explaining when it matters: trashing never deletes. The file is moved into the app's own quarantine folder and journaled with its original path, so the user can restore it from the Trash view at any time, or undo the whole batch with Undo last. Moves and organizing are reversible too, but only through Undo last right after the operation, since they are not listed in Trash. You have no way to delete anything permanently; only the user can do that, from the Trash view.\n\n\
+Rules are saved filters the user can re-run: a filter (name, extension, size, age, folder) plus one action (move to Trash, or move to a folder). When a cleanup looks like it will recur, offer to save it as a rule, and use preview_rule first so you can say exactly how many files it would catch. Sizes in filters are bytes, and older_than_days counts days since a file was last modified.\n\n\
+For questions about space, prefer storage_stats over guessing or listing folders one by one.\n\n\
+Writing: your replies are rendered as markdown. Use short paragraphs, bulleted lists for more than two items, and `inline code` for file names and paths. Keep it brief and concrete: numbers, sizes and real paths beat adjectives. Do not pad answers by restating the question.";
 
 /// A destructive tool the model requested; surfaced to the UI for approval.
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +51,22 @@ enum IndexFollowup {
         remove: Vec<PathBuf>,
         upsert: Vec<PathBuf>,
     },
+}
+
+/// JSON schema for a `RuleFilter`, shared by `preview_rule` and `create_rule`.
+fn rule_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Filter selecting files from the index. Every field is optional; populated fields are ANDed together, an empty filter matches everything.",
+        "properties": {
+            "name_contains": {"type": "string", "description": "Substring that must appear in the filename."},
+            "ext": {"type": "string", "description": "File extension without the dot, e.g. \"pdf\"."},
+            "min_size": {"type": "integer", "description": "Minimum file size in BYTES."},
+            "max_size": {"type": "integer", "description": "Maximum file size in BYTES."},
+            "older_than_days": {"type": "integer", "description": "Only files whose last modification is at least this many days ago."},
+            "in_folder": {"type": "string", "description": "Absolute folder path; matches files anywhere beneath it."}
+        }
+    })
 }
 
 fn tools() -> Value {
@@ -80,6 +99,23 @@ fn tools() -> Value {
             "parameters": {"type": "object", "properties": {}}
         }},
         {"type": "function", "function": {
+            "name": "storage_stats",
+            "description": "Storage overview of the indexed files: total count, total bytes, the largest files, and bytes grouped by extension. Use this to answer what is taking up space.",
+            "parameters": {"type": "object", "properties": {}}
+        }},
+        {"type": "function", "function": {
+            "name": "list_rules",
+            "description": "List the user's saved cleanup rules, with each rule's filter, action and last run stats.",
+            "parameters": {"type": "object", "properties": {}}
+        }},
+        {"type": "function", "function": {
+            "name": "preview_rule",
+            "description": "Count the files a candidate rule filter would match right now. Saves nothing and touches no files; use it to check a filter before proposing create_rule.",
+            "parameters": {"type": "object", "properties": {
+                "filter": rule_filter_schema()
+            }, "required": ["filter"]}
+        }},
+        {"type": "function", "function": {
             "name": "trash_files",
             "description": "Move files to Trash (reversible). Requires user approval before it runs; explain why first.",
             "parameters": {"type": "object", "properties": {
@@ -94,12 +130,24 @@ fn tools() -> Value {
                     "from": {"type": "string"}, "to": {"type": "string"}
                 }, "required": ["from", "to"]}, "description": "From/to absolute path pairs."}
             }, "required": ["moves"]}
+        }},
+        {"type": "function", "function": {
+            "name": "create_rule",
+            "description": "Save a reusable cleanup rule. It stores configuration only and never touches files by itself, but it requires user approval before it is saved; preview the filter first and explain what the rule would do.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Short human name for the rule."},
+                "filter": rule_filter_schema(),
+                "action": {"type": "object", "description": "What the rule does with matched files.", "properties": {
+                    "type": {"type": "string", "enum": ["Trash", "MoveTo"], "description": "\"Trash\" moves matches to Trash; \"MoveTo\" moves them into a folder."},
+                    "folder": {"type": "string", "description": "Absolute destination folder. Required when type is \"MoveTo\"."}
+                }, "required": ["type"]}
+            }, "required": ["name", "filter", "action"]}
         }}
     ])
 }
 
 fn is_destructive(name: &str) -> bool {
-    matches!(name, "trash_files" | "move_files")
+    matches!(name, "trash_files" | "move_files" | "create_rule")
 }
 
 /// Human one-liner for a pending destructive action card.
@@ -151,12 +199,23 @@ fn summarize(name: &str, args: &Value) -> String {
                 format!("Move {} file{} into {}/", moves.len(), plural, dest)
             }
         }
+        "create_rule" => {
+            let rule = args["name"].as_str().unwrap_or("untitled");
+            let dest = match args["action"]["type"].as_str() {
+                Some("MoveTo") => args["action"]["folder"].as_str().unwrap_or("a folder"),
+                _ => "Trash",
+            };
+            format!(
+                "Save a rule \"{}\" that moves matching files to {}",
+                rule, dest
+            )
+        }
         _ => name.to_string(),
     }
 }
 
 /// Run a read-only tool and return its JSON result. Never mutates anything.
-fn execute_read_tool(name: &str, args: &Value, index: &Index) -> Result<Value> {
+fn execute_read_tool(name: &str, args: &Value, index: &Index, rules: &Rules) -> Result<Value> {
     match name {
         "search_files" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -211,6 +270,52 @@ fn execute_read_tool(name: &str, args: &Value, index: &Index) -> Result<Value> {
             Ok(json!({"group_count": groups.len(), "groups": out}))
         }
         "index_stats" => Ok(json!({"indexed": index.count()?})),
+        "storage_stats" => {
+            let largest: Vec<Value> = index
+                .largest_files(15)?
+                .iter()
+                .map(|h| json!({"path": h.path, "name": h.name, "size": h.size}))
+                .collect();
+            let by_ext: Vec<Value> = index
+                .size_by_ext(10)?
+                .iter()
+                .map(|e| json!({"ext": e.ext, "count": e.count, "total_size": e.total_size}))
+                .collect();
+            Ok(json!({
+                "files": index.count()?,
+                "total_size": index.total_size()?,
+                "largest": largest,
+                "by_ext": by_ext
+            }))
+        }
+        "list_rules" => {
+            let out: Vec<Value> = rules
+                .list()?
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "name": r.name,
+                        "filter": r.filter,
+                        "action": r.action,
+                        "last_run_count": r.last_run_count,
+                        "last_run_ns": r.last_run_ns
+                    })
+                })
+                .collect();
+            Ok(json!({"count": out.len(), "rules": out}))
+        }
+        "preview_rule" => {
+            let filter: RuleFilter = serde_json::from_value(args["filter"].clone())
+                .map_err(|e| anyhow!("invalid filter: {}", e))?;
+            let hits = match_rule(index, &filter, 200)?;
+            let sample: Vec<Value> = hits
+                .iter()
+                .take(20)
+                .map(|h| json!({"path": h.path, "name": h.name, "size": h.size}))
+                .collect();
+            Ok(json!({"count": hits.len(), "sample": sample}))
+        }
         _ => Err(anyhow!("unknown read tool: {}", name)),
     }
 }
@@ -313,8 +418,27 @@ pub fn execute_destructive_tool(
     Ok(result)
 }
 
-/// Command-layer destructive dispatch: trash lock then index lock, non-overlapping.
+/// Approval-gated but not a filesystem change: stores a reusable rule. Needs only
+/// the rules store, so it never touches the trash or index locks.
+fn create_rule_tool(args: &Value, rules: &Rules) -> Result<Value> {
+    let name = args["name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing rule name"))?;
+    let filter: RuleFilter = serde_json::from_value(args["filter"].clone())
+        .map_err(|e| anyhow!("invalid filter: {}", e))?;
+    let action: RuleAction = serde_json::from_value(args["action"].clone())
+        .map_err(|e| anyhow!("invalid action (expected {{\"type\":\"Trash\"}} or {{\"type\":\"MoveTo\",\"folder\":\"/abs/dir\"}}): {}", e))?;
+    let rule = rules.create(name, filter, action)?;
+    Ok(json!({"created": true, "id": rule.id, "name": rule.name}))
+}
+
+/// Command-layer destructive dispatch: each tool runs under exactly the locks it
+/// needs, in non-overlapping scopes.
 fn dispatch_destructive(state: &AppState, name: &str, args: &Value) -> Result<Value> {
+    if name == "create_rule" {
+        let rules = state.rules.lock().unwrap();
+        return create_rule_tool(args, &rules);
+    }
     let (result, followup) = {
         let trash = state.trash.lock().unwrap();
         destructive_trash_phase(name, args, &trash)?
@@ -374,12 +498,13 @@ async fn run_loop(
         let mut tool_msgs = Vec::new();
         {
             let index = state.index.lock().unwrap();
+            let rules = state.rules.lock().unwrap();
             for tc in &reads {
                 let id = tc["id"].as_str().unwrap_or("");
                 let name = tc["function"]["name"].as_str().unwrap_or("");
                 let args = parse_args(tc);
                 let _ = app.emit("ai:step", json!({"kind": "tool", "name": name}));
-                let content = match execute_read_tool(name, &args, &index) {
+                let content = match execute_read_tool(name, &args, &index, &rules) {
                     Ok(v) => v.to_string(),
                     Err(e) => format!("Error: {}", e),
                 };
@@ -550,5 +675,140 @@ mod tests {
             &json!({"moves": [{"from": "/x/a.jpg", "to": "/x/Photos/a.jpg"}]}),
         );
         assert_eq!(s, "Move 1 file into Photos/");
+    }
+
+    #[test]
+    fn summarize_create_rule_shapes() {
+        let s = summarize(
+            "create_rule",
+            &json!({"name": "Old invoices", "filter": {"ext": "pdf"}, "action": {"type": "MoveTo", "folder": "/Users/x/Documents/Invoices"}}),
+        );
+        assert_eq!(
+            s,
+            "Save a rule \"Old invoices\" that moves matching files to /Users/x/Documents/Invoices"
+        );
+        let s = summarize(
+            "create_rule",
+            &json!({"name": "Big downloads", "filter": {"min_size": 1000}, "action": {"type": "Trash"}}),
+        );
+        assert_eq!(
+            s,
+            "Save a rule \"Big downloads\" that moves matching files to Trash"
+        );
+    }
+
+    #[test]
+    fn create_rule_is_approval_gated_and_reads_are_not() {
+        assert!(is_destructive("create_rule"));
+        assert!(is_destructive("trash_files"));
+        assert!(is_destructive("move_files"));
+        for name in [
+            "search_files",
+            "list_folder",
+            "find_duplicates",
+            "index_stats",
+            "storage_stats",
+            "list_rules",
+            "preview_rule",
+        ] {
+            assert!(!is_destructive(name), "{} must auto-run", name);
+        }
+        // the model must never be handed a way to delete permanently
+        let names: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n.contains("purge")
+            || n.contains("delete")
+            || n.contains("empty")
+            || n.contains("clear")));
+    }
+
+    #[test]
+    fn preview_rule_counts_and_samples_without_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.pdf"), vec![0u8; 300]).unwrap();
+        fs::write(src.join("b.pdf"), vec![0u8; 100]).unwrap();
+        fs::write(src.join("c.txt"), vec![0u8; 200]).unwrap();
+        let entries = WalkdirSource.enumerate(&src).unwrap();
+        let mut index = Index::open(&dir.path().join("index.db")).unwrap();
+        index.upsert_batch(&entries).unwrap();
+        let rules = Rules::open(dir.path()).unwrap();
+        let out = execute_read_tool(
+            "preview_rule",
+            &json!({"filter": {"ext": "pdf"}}),
+            &index,
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64(), Some(2));
+        assert_eq!(out["sample"][0]["name"].as_str(), Some("a.pdf"));
+        assert!(rules.list().unwrap().is_empty());
+        // a malformed filter is reported, not panicked on
+        assert!(execute_read_tool(
+            "preview_rule",
+            &json!({"filter": {"ext": 12}}),
+            &index,
+            &rules
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn create_rule_persists_and_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = Rules::open(dir.path()).unwrap();
+        let index = Index::open(&dir.path().join("index.db")).unwrap();
+        let args = json!({
+            "name": "Old invoices",
+            "filter": {"ext": "pdf", "older_than_days": 90},
+            "action": {"type": "MoveTo", "folder": "/Users/x/Documents/Invoices"}
+        });
+        let out = create_rule_tool(&args, &rules).unwrap();
+        assert_eq!(out["created"].as_bool(), Some(true));
+        let id = out["id"].as_str().unwrap();
+        let saved = rules.get(id).unwrap().unwrap();
+        assert_eq!(saved.name, "Old invoices");
+        assert_eq!(saved.filter.older_than_days, Some(90));
+        assert_eq!(
+            saved.action,
+            RuleAction::MoveTo {
+                folder: "/Users/x/Documents/Invoices".to_string()
+            }
+        );
+        let listed = execute_read_tool("list_rules", &json!({}), &index, &rules).unwrap();
+        assert_eq!(listed["count"].as_u64(), Some(1));
+        assert_eq!(listed["rules"][0]["id"].as_str(), Some(id));
+        assert_eq!(
+            listed["rules"][0]["action"]["type"].as_str(),
+            Some("MoveTo")
+        );
+        assert!(create_rule_tool(
+            &json!({"name": "bad", "filter": {}, "action": {"type": "Nope"}}),
+            &rules
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn storage_stats_reports_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("big.zip"), vec![0u8; 500]).unwrap();
+        fs::write(src.join("small.txt"), vec![0u8; 50]).unwrap();
+        let entries = WalkdirSource.enumerate(&src).unwrap();
+        let mut index = Index::open(&dir.path().join("index.db")).unwrap();
+        index.upsert_batch(&entries).unwrap();
+        let rules = Rules::open(dir.path()).unwrap();
+        let out = execute_read_tool("storage_stats", &json!({}), &index, &rules).unwrap();
+        assert_eq!(out["files"].as_u64(), Some(2));
+        assert_eq!(out["total_size"].as_u64(), Some(550));
+        assert_eq!(out["largest"][0]["name"].as_str(), Some("big.zip"));
+        assert_eq!(out["by_ext"][0]["ext"].as_str(), Some("zip"));
     }
 }

@@ -1,6 +1,8 @@
 import type {
   AgentResult,
+  Chat,
   ChatMessage,
+  ChatSummary,
   ContentHit,
   DupGroup,
   ExtStat,
@@ -385,6 +387,97 @@ function toolTurn(name: string, args: object, result: string): ChatMessage[] {
   ];
 }
 
+// The title a chat carries in the list: the first thing the user actually asked,
+// trimmed to one line.
+function chatTitle(messages: ChatMessage[]): string {
+  const first = messages.find((m) => m.role === "user" && m.content);
+  const text = String(first?.content ?? "")
+    .trim()
+    .replace(/\s+/g, " ");
+  if (!text) return "New chat";
+  return text.length > 64 ? text.slice(0, 63).trimEnd() + "…" : text;
+}
+
+// Tool traffic is bookkeeping, so the count reflects what the reader can see.
+function visibleCount(messages: ChatMessage[]): number {
+  return messages.filter(
+    (m) => (m.role === "user" || m.role === "assistant") && m.content,
+  ).length;
+}
+
+function makeChats(): Chat[] {
+  const raw: [number, number, ChatMessage[]][] = [
+    [
+      0.12,
+      0.08,
+      [
+        { role: "user", content: "Find duplicate photos in Downloads" },
+        ...toolTurn(
+          "find_duplicates",
+          { root: "/Users/you/Downloads" },
+          "Found 2 duplicate sets, 10.2 MB reclaimable.",
+        ),
+        {
+          role: "assistant",
+          content:
+            "Two photos in `~/Downloads` are byte-for-byte copies of files you already keep in `~/Pictures`:\n\n- `ridge.jpg` matches `Pictures/wallpapers/ridge.jpg`\n- `reykjavik-0433.jpg` matches `Pictures/2026/reykjavik-0433.jpg`\n\nTrashing both frees 10.2 MB and everything stays restorable from the Trash view.",
+        },
+        { role: "user", content: "Trash the Downloads copies" },
+        ...toolTurn("trash_files", { count: 2 }, "Moved 2 files to Trash."),
+        {
+          role: "assistant",
+          content:
+            "Done. Both copies are in Trash and the originals in `~/Pictures` are untouched.",
+        },
+      ],
+    ],
+    [
+      1.4,
+      1.35,
+      [
+        { role: "user", content: "What's taking up the most space?" },
+        ...toolTurn("storage_stats", {}, "460.1 GB across 24,817 files."),
+        {
+          role: "assistant",
+          content:
+            "Video is 62 percent of your 460 GB. `~/Movies/Renders` alone holds 47 GB, and the three largest files are all older cuts of the same edit:\n\n- `reykjavik-cut-final.mov`, 18.4 GB\n- `reykjavik-cut-v3.mov`, 16.9 GB\n- `product-tour-master.mov`, 7.9 GB\n\nThe v3 cut has not been opened in eleven days, so that is the safest 16.9 GB to reclaim.",
+        },
+      ],
+    ],
+    [
+      6.2,
+      5.9,
+      [
+        { role: "user", content: "Archive old invoices" },
+        ...toolTurn(
+          "search_files",
+          { name_contains: "invoice", older_than_days: 90 },
+          "9 invoice PDFs older than 90 days.",
+        ),
+        {
+          role: "assistant",
+          content:
+            "Nine invoice PDFs are older than 90 days and scattered across Downloads, Desktop, and Documents. Moving them into `Documents/Invoices/2025` keeps them searchable without cluttering those folders.",
+        },
+        { role: "user", content: "Do it, but leave the 2026 ones alone" },
+        ...toolTurn("move_files", { count: 9 }, "Moved 9 files."),
+        {
+          role: "assistant",
+          content:
+            "Moved all nine. The 2026 invoices stayed where they were. You can undo the whole move from the Trash view.",
+        },
+      ],
+    ],
+  ];
+  return raw.map(([created, updated, messages]) => ({
+    id: rid(),
+    title: chatTitle(messages),
+    created_ns: daysAgoNs(created),
+    updated_ns: daysAgoNs(updated),
+    messages,
+  }));
+}
+
 function mockBridge(): Bridge {
   const bus = new Map<string, Set<Handler<unknown>>>();
   const emit = (evt: string, payload: unknown) =>
@@ -400,6 +493,7 @@ function mockBridge(): Bridge {
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
+  const chats: Chat[] = makeChats();
   // What each rule run took out of the mock index, so undo can put it back.
   const undoable = new Map<string, { file: SearchHit; from: string }[]>();
 
@@ -849,6 +943,62 @@ function mockBridge(): Bridge {
           final_text,
           done: true,
         } as AgentResult as T;
+      }
+      case "list_chats": {
+        const limit = (args.limit as number) ?? 100;
+        return chats
+          .slice()
+          .sort((a, b) => b.updated_ns - a.updated_ns)
+          .slice(0, limit)
+          .map(
+            (c) =>
+              ({
+                id: c.id,
+                title: c.title,
+                created_ns: c.created_ns,
+                updated_ns: c.updated_ns,
+                message_count: visibleCount(c.messages),
+              }) as ChatSummary,
+          ) as T;
+      }
+      case "get_chat": {
+        const c = chats.find((x) => x.id === String(args.id));
+        return (c ? { ...c, messages: [...c.messages] } : null) as T;
+      }
+      case "save_chat": {
+        const messages = (args.messages as ChatMessage[]) ?? [];
+        const id = args.id == null ? null : String(args.id);
+        const now = Date.now() * 1e6;
+        const existing = id ? chats.find((c) => c.id === id) : undefined;
+        if (existing) {
+          existing.messages = [...messages];
+          existing.title = chatTitle(messages);
+          existing.updated_ns = now;
+          return { ...existing } as T;
+        }
+        const chat: Chat = {
+          id: rid(),
+          title: chatTitle(messages),
+          created_ns: now,
+          updated_ns: now,
+          messages: [...messages],
+        };
+        chats.push(chat);
+        return { ...chat } as T;
+      }
+      case "rename_chat": {
+        const c = chats.find((x) => x.id === String(args.id));
+        if (c) c.title = String(args.title ?? "").trim() || c.title;
+        return undefined as T;
+      }
+      case "delete_chat": {
+        const i = chats.findIndex((c) => c.id === String(args.id));
+        if (i >= 0) chats.splice(i, 1);
+        return undefined as T;
+      }
+      case "clear_chats": {
+        chats.length = 0;
+        return undefined as T;
       }
       default:
         throw new Error(`Unknown command: ${cmd}`);

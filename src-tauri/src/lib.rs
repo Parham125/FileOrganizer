@@ -1,5 +1,6 @@
 use fo_ai::organize::{self, Move};
 use fo_ai::OpenRouter;
+use fo_chats::{derive_title, Chat, ChatSummary, Chats};
 use fo_dedup::{find_duplicates, find_similar_images, DupGroup, SimilarGroup};
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
@@ -18,6 +19,7 @@ struct AppState {
     index: Mutex<Index>,
     trash: Mutex<Trash>,
     rules: Mutex<Rules>,
+    chats: Mutex<Chats>,
     watchers: Mutex<Vec<Watcher>>,
 }
 
@@ -577,6 +579,87 @@ async fn ai_chat(prompt: String, model: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn list_chats(limit: Option<i64>, state: State<AppState>) -> Result<Vec<ChatSummary>, String> {
+    state
+        .chats
+        .lock()
+        .unwrap()
+        .list(limit.unwrap_or(100))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_chat(id: String, state: State<AppState>) -> Result<Option<Chat>, String> {
+    state
+        .chats
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a transcript, creating the chat on first save. The returned chat is
+/// how the UI learns the id it should keep saving into, and the derived title.
+#[tauri::command]
+fn save_chat(
+    id: Option<String>,
+    messages: serde_json::Value,
+    state: State<AppState>,
+) -> Result<Chat, String> {
+    let chats = state.chats.lock().unwrap();
+    let existing = match id.as_deref() {
+        Some(id) => chats.get(id).map_err(|e| e.to_string())?,
+        None => None,
+    };
+    match existing {
+        Some(chat) => {
+            // a chat still on its placeholder name gets a real one once the user has spoken
+            let title = (chat.title == "New chat").then(|| derive_title(&messages));
+            chats
+                .save(&chat.id, title.as_deref(), &messages)
+                .map_err(|e| e.to_string())?;
+            chats
+                .get(&chat.id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("chat {} vanished while saving", chat.id))
+        }
+        None => chats
+            .create(&derive_title(&messages), &messages)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+#[tauri::command]
+fn rename_chat(id: String, title: String, state: State<AppState>) -> Result<(), String> {
+    state
+        .chats
+        .lock()
+        .unwrap()
+        .rename(&id, &title)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_chat(id: String, state: State<AppState>) -> Result<(), String> {
+    state
+        .chats
+        .lock()
+        .unwrap()
+        .delete(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_chats(state: State<AppState>) -> Result<(), String> {
+    state
+        .chats
+        .lock()
+        .unwrap()
+        .delete_all()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn empty_trash(state: State<AppState>) -> Result<(), String> {
     state
         .trash
@@ -634,10 +717,12 @@ pub fn run() {
             let index = Index::open(&dir.join("index.db"))?;
             let trash = Trash::open(&dir)?;
             let rules = Rules::open(&dir)?;
+            let chats = Chats::open(&dir)?;
             app.manage(AppState {
                 index: Mutex::new(index),
                 trash: Mutex::new(trash),
                 rules: Mutex::new(rules),
+                chats: Mutex::new(chats),
                 watchers: Mutex::new(Vec::new()),
             });
             Ok(())
@@ -675,6 +760,12 @@ pub fn run() {
             ai_propose_organization,
             ai_apply_organization,
             ai_chat,
+            list_chats,
+            get_chat,
+            save_chat,
+            rename_chat,
+            delete_chat,
+            clear_chats,
             agent::ai_agent,
             agent::ai_agent_continue
         ])

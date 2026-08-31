@@ -108,6 +108,24 @@ export type ChatMessage = {
   name?: string;
 };
 
+// Saved conversations. The list view only needs the header fields, so it never
+// pulls whole transcripts across the bridge.
+export type ChatSummary = {
+  id: string;
+  title: string;
+  created_ns: number;
+  updated_ns: number;
+  message_count: number;
+};
+
+export type Chat = {
+  id: string;
+  title: string;
+  created_ns: number;
+  updated_ns: number;
+  messages: ChatMessage[];
+};
+
 export type PendingAction = {
   id: string;
   name: string;

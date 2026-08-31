@@ -52,7 +52,7 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 
 🗂️ **AI organizer.** Point it at a messy folder and it proposes a tidy structure. You preview every move before anything happens, and it is fully reversible.
 
-💬 **AI assistant.** A chat that can actually act: it searches, scans for duplicates, and proposes changes using real tools. Replies stream in as they are written, with live tool activity and formatted markdown. Read-only actions run on their own; anything that moves or trashes a file becomes a one-tap approval card showing exactly which files are affected.
+💬 **AI assistant.** A chat that can actually act: it searches, scans for duplicates, reads your storage breakdown, and proposes changes using real tools. It can also offer to save a recurring cleanup as a rule. Replies stream in as they are written, with live tool activity and formatted markdown, and past conversations are saved so you can pick one back up. Read-only actions run on their own; anything that moves or trashes a file becomes a one-tap approval card showing exactly which files are affected.
 
 🛟 **Safe by design.** Deletions go to an app-managed Trash with a full undo journal. Restore any file, undo the last change, or remove-forever when you are sure. Moves never overwrite, and the AI has no permanent-delete power at all.
 

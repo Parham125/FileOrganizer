@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "src-tauri"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
@@ -19,3 +19,4 @@ fo-trash = { path = "crates/trash" }
 fo-ai = { path = "crates/ai" }
 fo-extract = { path = "crates/extract" }
 fo-rules = { path = "crates/rules" }
+fo-chats = { path = "crates/chats" }

@@ -142,6 +142,21 @@ export const IconSend = (p: P) => (
   </S>
 );
 
+export const IconHistory = (p: P) => (
+  <S {...p}>
+    <path d="M3.5 5.5v4.5H8" />
+    <path d="M4 10a8 8 0 1 1 1 5" />
+    <path d="M12 8v4.5l3 1.8" />
+  </S>
+);
+
+export const IconPencil = (p: P) => (
+  <S {...p}>
+    <path d="M4 20h4L19.5 8.5a2 2 0 0 0 0-2.8l-1.2-1.2a2 2 0 0 0-2.8 0L4 16z" />
+    <path d="M14.5 6.5 17.5 9.5" />
+  </S>
+);
+
 export const IconKey = (p: P) => (
   <S {...p}>
     <circle cx="8" cy="12" r="4" />
