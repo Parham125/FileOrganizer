@@ -11,4 +11,6 @@ fo-indexer.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
+fo-dedup.workspace = true
+fo-hasher.workspace = true
 tempfile = "3"

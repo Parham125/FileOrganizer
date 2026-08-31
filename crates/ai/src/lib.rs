@@ -59,6 +59,43 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// Token and cost accounting for one request, as reported by OpenRouter's
+/// `usage: {include: true}`. `cached_tokens` is the part of `prompt_tokens` that
+/// was served from the provider's prompt cache instead of being billed in full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost: Option<f64>,
+}
+
+impl Usage {
+    /// Pull the `usage` object off a response body or a streamed chunk. Returns
+    /// `None` when there is no usage object at all; every field inside is optional
+    /// because providers disagree on where cached counts live and `cost` only
+    /// appears once OpenRouter has settled accounting for the request.
+    pub fn from_response(v: &serde_json::Value) -> Option<Usage> {
+        let u = v.get("usage")?;
+        if !u.is_object() {
+            return None;
+        }
+        let details = &u["prompt_tokens_details"];
+        let cached = details["cached_tokens"]
+            .as_u64()
+            .or_else(|| details["cache_read_tokens"].as_u64())
+            .or_else(|| u["cache_read_input_tokens"].as_u64())
+            .or_else(|| u["cached_tokens"].as_u64())
+            .unwrap_or(0);
+        Some(Usage {
+            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+            cached_tokens: cached,
+            cost: u["cost"].as_f64(),
+        })
+    }
+}
+
 /// One tool call being rebuilt from streamed fragments. `name` and `arguments`
 /// arrive split across any number of chunks and are concatenated in order.
 #[derive(Debug, Default)]
@@ -77,6 +114,7 @@ pub struct StreamAccum {
     content: String,
     reasoning: String,
     tool_calls: BTreeMap<u64, ToolCallAccum>,
+    usage: Option<Usage>,
 }
 
 impl StreamAccum {
@@ -114,6 +152,11 @@ impl StreamAccum {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
             return;
         };
+        // Usage rides a late chunk that usually carries an empty `choices` array;
+        // last one wins so a partial early report cannot shadow the final totals.
+        if let Some(usage) = Usage::from_response(&v) {
+            self.usage = Some(usage);
+        }
         let delta = &v["choices"][0]["delta"];
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
@@ -148,8 +191,14 @@ impl StreamAccum {
         }
     }
 
+    /// Accounting reported so far, or `None` if no chunk carried a usage object.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
+
     /// Rebuild the assistant message: `content` (null when nothing streamed) plus
-    /// `tool_calls` only when the model asked for any.
+    /// `tool_calls` only when the model asked for any, and a non-standard `usage`
+    /// field when the stream reported accounting.
     pub fn finish(self) -> serde_json::Value {
         let content = if self.content.is_empty() {
             serde_json::Value::Null
@@ -173,6 +222,11 @@ impl StreamAccum {
                 })
                 .collect();
         }
+        if let Some(usage) = self.usage {
+            if let Ok(v) = serde_json::to_value(usage) {
+                msg["usage"] = v;
+            }
+        }
         msg
     }
 }
@@ -182,6 +236,7 @@ pub struct OpenRouter {
     api_key: String,
     model: String,
     reasoning: ReasoningEffort,
+    caching: bool,
     client: reqwest::Client,
 }
 
@@ -196,6 +251,7 @@ impl OpenRouter {
             api_key,
             model,
             reasoning: ReasoningEffort::default(),
+            caching: true,
             client: reqwest::Client::new(),
         }
     }
@@ -206,11 +262,30 @@ impl OpenRouter {
         self
     }
 
+    /// Turn prompt caching on or off for the tool-calling turns. On by default;
+    /// the escape hatch exists in case a provider ever rejects `cache_control`.
+    pub fn with_caching(mut self, caching: bool) -> Self {
+        self.caching = caching;
+        self
+    }
+
     /// Add `reasoning.effort` to a request body, or leave the body untouched when off.
     /// Deliberately never sends `max_tokens`: adaptive-thinking models ignore it.
     fn apply_reasoning(&self, body: &mut serde_json::Value) {
         if let Some(effort) = self.reasoning.as_effort() {
             body["reasoning"] = serde_json::json!({"effort": effort});
+        }
+    }
+
+    /// Ask for usage accounting, and place a cache breakpoint at the last cacheable
+    /// block. The top-level form is provider-agnostic: OpenRouter translates it to
+    /// Anthropic's explicit `cache_control` and it is a no-op on providers that
+    /// cache automatically. Only used by the agent loop, where the system prompt,
+    /// tool schemas and transcript prefix are re-sent on every step.
+    fn apply_caching_and_usage(&self, body: &mut serde_json::Value) {
+        body["usage"] = serde_json::json!({"include": true});
+        if self.caching {
+            body["cache_control"] = serde_json::json!({"type": "ephemeral"});
         }
     }
 
@@ -261,6 +336,7 @@ impl OpenRouter {
             body["tool_choice"] = serde_json::json!("auto");
         }
         self.apply_reasoning(&mut body);
+        self.apply_caching_and_usage(&mut body);
         let resp = self
             .client
             .post(CHAT_URL)
@@ -280,9 +356,16 @@ impl OpenRouter {
             return Err(anyhow!("OpenRouter error ({}): {}", status.as_u16(), msg));
         }
         let v: serde_json::Value = serde_json::from_str(&text)?;
-        let msg = v["choices"][0]["message"].clone();
+        let mut msg = v["choices"][0]["message"].clone();
         if msg.is_null() {
             return Err(anyhow!("OpenRouter response had no message"));
+        }
+        if msg.is_object() {
+            if let Some(usage) = Usage::from_response(&v) {
+                if let Ok(u) = serde_json::to_value(usage) {
+                    msg["usage"] = u;
+                }
+            }
         }
         Ok(msg)
     }
@@ -290,7 +373,8 @@ impl OpenRouter {
     /// Streaming twin of `chat_raw`. `on_delta` is called with each content token
     /// and `on_reasoning` with each reasoning token as they arrive; the returned
     /// value is the same assistant message shape `chat_raw` produces, plus a
-    /// `reasoning` field when the model streamed any.
+    /// `reasoning` field when the model streamed any and a `usage` field when the
+    /// stream reported accounting.
     pub async fn chat_raw_stream<F, R>(
         &self,
         messages: serde_json::Value,
@@ -309,6 +393,7 @@ impl OpenRouter {
             body["tool_choice"] = serde_json::json!("auto");
         }
         self.apply_reasoning(&mut body);
+        self.apply_caching_and_usage(&mut body);
         let resp = self
             .client
             .post(CHAT_URL)
@@ -507,6 +592,126 @@ mod tests {
         let mut body = serde_json::json!({"model": "m"});
         client.apply_reasoning(&mut body);
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn caching_and_usage_land_in_the_request_body() {
+        let client = OpenRouter::new("k".into(), "m".into());
+        let mut body = serde_json::json!({"model": "m"});
+        client.apply_caching_and_usage(&mut body);
+        assert_eq!(body["usage"], serde_json::json!({"include": true}));
+        assert_eq!(
+            body["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        let client = client.with_caching(false);
+        let mut body = serde_json::json!({"model": "m"});
+        client.apply_caching_and_usage(&mut body);
+        assert!(body.get("cache_control").is_none());
+        // usage accounting is free and stays on even with caching disabled
+        assert_eq!(body["usage"], serde_json::json!({"include": true}));
+    }
+
+    #[test]
+    fn usage_parses_full_partial_and_absent_shapes() {
+        // the documented OpenRouter shape, cache-write leg included
+        let full = serde_json::json!({"usage": {
+            "prompt_tokens": 4210, "completion_tokens": 118, "total_tokens": 4328,
+            "completion_tokens_details": {"reasoning_tokens": 40},
+            "prompt_tokens_details": {"cached_tokens": 3968, "cache_write_tokens": 0, "audio_tokens": 0},
+            "cost": 0.004312, "cost_details": {"upstream_inference_cost": 0.004}
+        }});
+        assert_eq!(
+            Usage::from_response(&full).unwrap(),
+            Usage {
+                prompt_tokens: 4210,
+                completion_tokens: 118,
+                cached_tokens: 3968,
+                cost: Some(0.004312)
+            }
+        );
+        // Anthropic-native key for cache reads
+        let native =
+            serde_json::json!({"usage": {"prompt_tokens": 10, "cache_read_input_tokens": 7}});
+        assert_eq!(Usage::from_response(&native).unwrap().cached_tokens, 7);
+        // no cost, no cached details: zeros and None, no panic
+        let partial = serde_json::json!({"usage": {"prompt_tokens": 51, "completion_tokens": 9}});
+        assert_eq!(
+            Usage::from_response(&partial).unwrap(),
+            Usage {
+                prompt_tokens: 51,
+                completion_tokens: 9,
+                cached_tokens: 0,
+                cost: None
+            }
+        );
+        // empty object is still a usage report, just an empty one
+        assert_eq!(
+            Usage::from_response(&serde_json::json!({"usage": {}})).unwrap(),
+            Usage::default()
+        );
+        // absent or wrongly shaped: None rather than an error
+        assert!(Usage::from_response(&serde_json::json!({"choices": []})).is_none());
+        assert!(Usage::from_response(&serde_json::json!({"usage": null})).is_none());
+        assert!(Usage::from_response(&serde_json::json!({"usage": "n/a"})).is_none());
+        assert!(Usage::from_response(&serde_json::json!("not an object")).is_none());
+    }
+
+    #[test]
+    fn trailing_usage_chunk_is_captured_and_attached() {
+        let mut accum = StreamAccum::default();
+        let mut on_delta = |_: &str| {};
+        let mut on_reasoning = |_: &str| {};
+        accum.feed(
+            content_chunk("done").as_bytes(),
+            &mut on_delta,
+            &mut on_reasoning,
+        );
+        assert!(accum.usage().is_none());
+        // OpenRouter's documented tail: a final chunk that still carries a choices
+        // entry (empty content, finish_reason set) with usage bolted on, then [DONE]
+        let tail = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 900, "completion_tokens": 12, "total_tokens": 912,
+                "prompt_tokens_details": {"cached_tokens": 768, "cache_write_tokens": 0}, "cost": 0.0011
+            }
+        });
+        accum.feed(
+            format!("data: {}\n\ndata: [DONE]\n\n", tail).as_bytes(),
+            &mut on_delta,
+            &mut on_reasoning,
+        );
+        // some providers instead send a bare usage frame with no choices at all
+        let bare = serde_json::json!({"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 12, "prompt_tokens_details": {"cached_tokens": 768}, "cost": 0.0011}});
+        accum.feed(
+            format!("data: {}\n\n", bare).as_bytes(),
+            &mut on_delta,
+            &mut on_reasoning,
+        );
+        let usage = accum.usage().unwrap();
+        assert_eq!(usage.prompt_tokens, 900);
+        assert_eq!(usage.cached_tokens, 768);
+        assert_eq!(usage.cost, Some(0.0011));
+        let msg = accum.finish();
+        assert_eq!(msg["content"], "done");
+        assert_eq!(msg["usage"]["prompt_tokens"], 900);
+        assert_eq!(msg["usage"]["completion_tokens"], 12);
+        assert_eq!(msg["usage"]["cached_tokens"], 768);
+        assert_eq!(msg["usage"]["cost"], 0.0011);
+    }
+
+    #[test]
+    fn finish_omits_usage_when_the_stream_never_reported_any() {
+        let mut accum = StreamAccum::default();
+        let mut on_delta = |_: &str| {};
+        let mut on_reasoning = |_: &str| {};
+        accum.feed(
+            content_chunk("hi").as_bytes(),
+            &mut on_delta,
+            &mut on_reasoning,
+        );
+        assert!(accum.finish().get("usage").is_none());
     }
 
     #[test]

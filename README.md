@@ -54,7 +54,9 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 
 💬 **AI assistant.** A chat that can actually act: it searches, scans for duplicates, reads your storage breakdown, and proposes changes using real tools. It can also offer to save a recurring cleanup as a rule. Replies stream in as they are written, with live tool activity and formatted markdown, and past conversations are saved so you can pick one back up. Read-only actions run on their own; anything that moves or trashes a file becomes a one-tap approval card showing exactly which files are affected.
 
-🛟 **Safe by design.** Deletions go to an app-managed Trash with a full undo journal. Restore any file, undo the last change, or remove-forever when you are sure. Moves never overwrite, and the AI has no permanent-delete power at all.
+🛟 **Safe by design.** Deletions go to an app-managed Trash with a full undo journal, kept on the same drive as the file, so trashing from an external disk is instant and costs nothing on your system drive. Restore any file, undo the last change, or remove-forever when you are sure. Moves never overwrite, and the AI has no permanent-delete power at all.
+
+⏹️ **Built for big, slow disks.** Scans can be stopped at any point, and a sequential mode reads one file at a time, which is usually much faster on an external or spinning drive. Duplicates can be found across every drive you have indexed at once, straight from the index with no re-walk.
 
 🗜️ **Looks inside archives.** The assistant can list what is in a `.zip`, `.tar`, `.tar.gz` or `.7z` without extracting it, so you know what a big archive holds before deciding its fate. (RAR is not supported: every Rust binding ships bundled non-free C++.)
 

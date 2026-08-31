@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,15 +10,24 @@ pub enum HashAlgo {
     Sha256,
 }
 
-/// Hash a file's contents and return lowercase hex.
+/// Read size for full-file hashing. Large enough that a multi-gigabyte file is
+/// read in a few thousand syscalls rather than tens of thousands, which matters
+/// most on spinning disks where each read costs a seek if the head has moved.
+/// Heap allocated: a buffer this size does not belong on the stack.
+const READ_CHUNK: usize = 1 << 20;
+
+/// Hash a file's contents and return lowercase hex. Streamed in chunks, so peak
+/// memory is the buffer regardless of how big the file is.
 pub fn hash_file(path: &Path, algo: HashAlgo) -> Result<String> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut buf = [0u8; 65536];
+    // No BufReader: these reads are already far larger than its buffer, so it
+    // would just pass them straight through.
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; READ_CHUNK];
     match algo {
         HashAlgo::Blake3 => {
             let mut hasher = blake3::Hasher::new();
             loop {
-                let n = reader.read(&mut buf)?;
+                let n = file.read(&mut buf)?;
                 if n == 0 {
                     break;
                 }
@@ -29,7 +38,7 @@ pub fn hash_file(path: &Path, algo: HashAlgo) -> Result<String> {
         HashAlgo::Sha256 => {
             let mut hasher = Sha256::new();
             loop {
-                let n = reader.read(&mut buf)?;
+                let n = file.read(&mut buf)?;
                 if n == 0 {
                     break;
                 }

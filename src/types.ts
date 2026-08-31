@@ -23,6 +23,22 @@ export type SimilarGroup = {
   distance: number;
 };
 
+// How aggressively a scan reads the disk. "sequential" reads one file at a
+// time, which suits external and spinning drives.
+export type ScanMode = "auto" | "sequential";
+
+// Long operations can be stopped mid-run, so every one of them answers with
+// whatever it managed to finish plus whether the user stopped it.
+// group_count is the true number of sets the scan confirmed, which can exceed
+// the groups it hands back when the backend caps the payload.
+export type DupScanResult = {
+  group_count: number;
+  groups: DupGroup[];
+  cancelled: boolean;
+};
+export type SimilarScanResult = { groups: SimilarGroup[]; cancelled: boolean };
+export type IndexResult = { count: number; cancelled: boolean };
+
 export type ContentHit = {
   path: string;
   snippet: string;
@@ -144,16 +160,42 @@ export type PendingAction = {
   args: Record<string, unknown>;
 };
 
+// Something the model wants the user to settle before it goes on. Nothing is
+// authorized here, so it is not a PendingAction: the answer is just text going
+// back into the transcript.
+export type QuestionOption = { label: string; description?: string | null };
+
+export type PendingQuestion = {
+  id: string;
+  question: string;
+  options: QuestionOption[];
+  multi_select: boolean;
+  allow_text: boolean;
+};
+
+export type QuestionAnswer = { id: string; value: string };
+
 // Live turn events: "ai:delta" and "ai:reasoning" each carry a bare text
-// fragment, "ai:step" one of these, "ai:done" nothing at all.
+// fragment, "ai:step" one of these, "ai:usage" the meter below, "ai:done"
+// nothing at all.
 export type AgentStep = {
-  kind: "thinking" | "tool" | "tool_done" | "awaiting_approval";
+  kind: "thinking" | "tool" | "tool_done" | "awaiting_approval" | "question";
   name?: string;
+};
+
+// What one model step burned. cost is null when the provider did not price it.
+// The view sums these over a turn, which is the only number worth reading.
+export type AgentUsage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  cost: number | null;
 };
 
 export type AgentResult = {
   messages: ChatMessage[];
   pending: PendingAction[];
+  question: PendingQuestion | null;
   final_text: string | null;
   done: boolean;
 };

@@ -6,11 +6,14 @@ import type {
   ChatSummary,
   ContentHit,
   DupGroup,
+  DupScanResult,
   ExtStat,
+  IndexResult,
   KeyStorage,
   Move,
   PendingAction,
   Progress,
+  QuestionAnswer,
   ReasoningEffort,
   Rule,
   RuleFilter,
@@ -18,6 +21,7 @@ import type {
   SearchHit,
   SearchOpts,
   SimilarGroup,
+  SimilarScanResult,
   StorageStats,
   TrashItem,
 } from "./types";
@@ -165,8 +169,11 @@ function makeLargest(): SearchHit[] {
   }));
 }
 
+// The four sets a reader recognises from the rest of the mock, then enough
+// filler to look like a real drive: a big scan runs to thousands of sets, and
+// the list has to stay usable at that size.
 function makeDupGroups(): DupGroup[] {
-  return [
+  const groups: DupGroup[] = [
     {
       hash: "a19f4c07b2e18d3f",
       size: 214_000,
@@ -203,6 +210,44 @@ function makeDupGroups(): DupGroup[] {
       ],
     },
   ];
+  const stems: [string, string, number][] = [
+    ["invoice", "pdf", 214_000],
+    ["scan", "tiff", 22_400_000],
+    ["headshot", "png", 3_400_000],
+    ["first-take", "wav", 41_300_000],
+    ["board-deck", "key", 48_200_000],
+    ["dataset", "csv", 88_500_000],
+    ["lease", "pdf", 920_000],
+    ["drone", "mp4", 1_900_000_000],
+    ["logo-mark", "svg", 18_400],
+    ["schema", "sql", 24_500],
+    ["mixdown", "wav", 1_100_000_000],
+    ["reykjavik", "jpg", 8_900_000],
+  ];
+  const folders = [
+    "/Users/you/Downloads",
+    "/Users/you/Desktop",
+    "/Users/you/Documents/Scans",
+    "/Users/you/Pictures/2026",
+    "/Users/you/Pictures/exports",
+    "/Users/you/Archive/2019",
+    "/Users/you/Music/demos",
+    "/Users/you/Projects/atlas/assets",
+  ];
+  for (let i = 0; i < 116; i++) {
+    const [stem, ext, size] = stems[i % stems.length];
+    const copies = 2 + (i % 3);
+    groups.push({
+      hash: rid().slice(0, 16),
+      size,
+      paths: Array.from(
+        { length: copies },
+        (_, c) =>
+          `${folders[(i + c * 3) % folders.length]}/${stem}-${1000 + i}${c === 0 ? "" : c === 1 ? " copy" : ` copy ${c}`}.${ext}`,
+      ),
+    });
+  }
+  return groups;
 }
 
 function makeSimilarGroups(): SimilarGroup[] {
@@ -529,6 +574,17 @@ function mockBridge(): Bridge {
   const appDataDir =
     "/Users/you/Library/Application Support/com.parham.fileorganizer";
   let appDataBytes = 50_412_000;
+  let cancelRamp: (() => void) | null = null;
+  const roots = [
+    "/Users/you/Documents",
+    "/Users/you/Pictures",
+    "/Volumes/Archive/scans",
+  ];
+  const rootRows: Record<string, number> = {
+    "/Users/you/Documents": 9_212,
+    "/Users/you/Pictures": 11_340,
+    "/Volumes/Archive/scans": 4_265,
+  };
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
@@ -536,16 +592,29 @@ function mockBridge(): Bridge {
   // What each rule run took out of the mock index, so undo can put it back.
   const undoable = new Map<string, { file: SearchHit; from: string }[]>();
 
-  function ramp(evt: string, total: number, ms: number): Promise<void> {
+  // Resolves true when the run was stopped part way through. Only one long
+  // operation runs at a time, same as the desktop app.
+  function ramp(evt: string, total: number, ms: number): Promise<boolean> {
     return new Promise((resolve) => {
-      const steps = 24;
+      const steps = 40;
       let i = 0;
+      let stopped = false;
+      cancelRamp = () => {
+        stopped = true;
+      };
       const tick = () => {
+        if (stopped) {
+          cancelRamp = null;
+          resolve(true);
+          return;
+        }
         i++;
         const done = Math.round((i / steps) * total);
         emit(evt, { done, total } as Progress);
-        if (i >= steps) resolve();
-        else setTimeout(tick, ms / steps);
+        if (i >= steps) {
+          cancelRamp = null;
+          resolve(false);
+        } else setTimeout(tick, ms / steps);
       };
       emit(evt, { done: 0, total } as Progress);
       setTimeout(tick, ms / steps);
@@ -575,6 +644,20 @@ function mockBridge(): Bridge {
     think = "",
   ): Promise<void> {
     const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // Every model step reports its own meter. Later steps resend the same
+    // prompt prefix, so the cached share climbs as the turn goes on.
+    const meter = (
+      prompt: number,
+      completion: number,
+      cached: number,
+      cost: number,
+    ) =>
+      emit("ai:usage", {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        cached_tokens: cached,
+        cost,
+      });
     emit("ai:step", { kind: "thinking" });
     await wait(200);
     for (const frag of effort === "off" || !think
@@ -589,18 +672,21 @@ function mockBridge(): Bridge {
       await wait(14);
     }
     if (lead) await wait(180);
+    meter(1_812, Math.round((lead.length + think.length) / 4) + 12, 0, 0.0024);
     for (const name of tools) {
       emit("ai:step", { kind: "tool", name });
       await wait(320);
       emit("ai:step", { kind: "tool_done", name });
       await wait(110);
     }
+    if (tools.length > 0) meter(2_346, 61, 1_536, 0.0016);
     emit("ai:step", { kind: "thinking" });
     await wait(150);
     for (const frag of text.split(/(?<=\s)/)) {
       emit("ai:delta", frag);
       await wait(14);
     }
+    meter(2_904, Math.round(text.length / 4) + 8, 2_304, 0.0041);
   }
 
   const invoke = async <T>(
@@ -620,9 +706,31 @@ function mockBridge(): Bridge {
           by_ext: byExt,
         } as StorageStats as T;
       case "index_folder": {
-        await ramp("index:progress", 8_421, 1400);
-        indexed += 8_421;
-        return indexed as T;
+        const cancelled = await ramp("index:progress", 8_421, 2600);
+        indexed += cancelled ? 2_640 : 8_421;
+        const path = String(args.path ?? "/Users/you/Downloads");
+        if (!cancelled && !roots.includes(path)) {
+          roots.push(path);
+          rootRows[path] = 8_421;
+        }
+        return { count: indexed, cancelled } as IndexResult as T;
+      }
+      case "cancel_scan": {
+        if (!cancelRamp) return false as T;
+        cancelRamp();
+        return true as T;
+      }
+      case "list_indexed_roots":
+        return [...roots] as T;
+      case "remove_indexed_root": {
+        const path = String(args.path ?? "");
+        const at = roots.indexOf(path);
+        if (at < 0) return 0 as T;
+        roots.splice(at, 1);
+        const rows = rootRows[path] ?? 0;
+        delete rootRows[path];
+        indexed = Math.max(0, indexed - rows);
+        return rows as T;
       }
       case "start_watch":
         watching = true;
@@ -653,17 +761,38 @@ function mockBridge(): Bridge {
         return out as T;
       }
       case "scan_duplicates": {
-        await ramp("dedup:progress", 1_204, 1300);
-        return makeDupGroups() as T;
+        // Sequential reads one file at a time, so the mock run takes longer.
+        const slow = args.mode === "sequential";
+        const cancelled = await ramp(
+          "dedup:progress",
+          1_204,
+          slow ? 3400 : 2600,
+        );
+        const all = makeDupGroups();
+        const groups = cancelled ? all.slice(0, 41) : all;
+        return {
+          group_count: groups.length,
+          groups,
+          cancelled,
+        } as DupScanResult as T;
       }
       case "scan_similar_images": {
-        await ramp("similar:progress", 3_190, 1300);
-        return makeSimilarGroups() as T;
+        const slow = args.mode === "sequential";
+        const cancelled = await ramp(
+          "similar:progress",
+          3_190,
+          slow ? 3400 : 2600,
+        );
+        const all = makeSimilarGroups();
+        return {
+          groups: cancelled ? all.slice(0, 1) : all,
+          cancelled,
+        } as SimilarScanResult as T;
       }
       case "index_content": {
-        await ramp("content:progress", 612, 1500);
-        contentIndexed = 612;
-        return contentIndexed as T;
+        const cancelled = await ramp("content:progress", 612, 2600);
+        contentIndexed = cancelled ? 214 : 612;
+        return { count: contentIndexed, cancelled } as IndexResult as T;
       }
       case "search_content": {
         const q = String(args.query ?? "").trim();
@@ -924,6 +1053,57 @@ function mockBridge(): Bridge {
         const last =
           [...incoming].reverse().find((m) => m.role === "user")?.content ?? "";
         const text = String(last).toLowerCase();
+        // One thing the model cannot guess: where the user wants files to land.
+        // It stops and asks instead of picking a folder on their behalf.
+        if (/sort|file away|archive|which folder|where should/.test(text)) {
+          const said =
+            "I found **12 receipts** scattered across `~/Downloads` and the Desktop, all from this year. Before I move anything, I need to know where they belong.";
+          const lead = "Reading what is actually in Downloads first.";
+          await streamTurn(
+            lead,
+            ["list_folder"],
+            said,
+            "There are three plausible destinations and picking wrong means the user hunts for these files later. Documents/Invoices/2026 already holds this year's invoices, so it is the tidiest, but a separate Receipts folder is defensible if they file receipts apart from invoices. That is a preference, not something I can read off the disk, so I should ask rather than guess.",
+          );
+          emit("ai:step", { kind: "question" });
+          emit("ai:done", undefined);
+          const messages: ChatMessage[] = [
+            ...incoming,
+            ...toolTurn(
+              "list_folder",
+              { path: "/Users/you/Downloads" },
+              "34 files, 12 of them receipt PDFs.",
+              lead,
+            ),
+            { role: "assistant", content: said },
+          ];
+          return {
+            messages,
+            pending: [],
+            question: {
+              id: "q_" + rid(),
+              question: "Where should the receipts go?",
+              options: [
+                {
+                  label: "Documents/Invoices/2026",
+                  description: "Where this year's invoices already live",
+                },
+                {
+                  label: "Documents/Receipts",
+                  description: "A new folder, kept apart from invoices",
+                },
+                {
+                  label: "Leave them in Downloads",
+                  description: "Rename them in place instead of moving them",
+                },
+              ],
+              multi_select: false,
+              allow_text: true,
+            },
+            final_text: said,
+            done: false,
+          } as AgentResult as T;
+        }
         const wantsAction =
           /duplicate|trash|delete|remove|organi|clean|tidy|move/.test(text);
         if (wantsAction) {
@@ -973,6 +1153,7 @@ function mockBridge(): Bridge {
           return {
             messages,
             pending,
+            question: null,
             final_text: messages[messages.length - 1].content ?? null,
             done: false,
           } as AgentResult as T;
@@ -1016,12 +1197,36 @@ function mockBridge(): Bridge {
         return {
           messages,
           pending: [],
+          question: null,
           final_text: reply,
           done: true,
         } as AgentResult as T;
       }
       case "ai_agent_continue": {
         const incoming = (args.messages as ChatMessage[]) ?? [];
+        const answers = (args.answers as QuestionAnswer[]) ?? [];
+        if (answers.length > 0) {
+          const value = answers[0].value.trim();
+          const reply = value
+            ? `Filing them under \`${value}\`. I will keep the original names so the dates stay searchable, and I will show you every move before it runs.`
+            : "Left the receipts where they are. Nothing moved, and you can ask again whenever you want them filed.";
+          await streamTurn(
+            "",
+            [],
+            reply,
+            value
+              ? "They picked a destination, so the guesswork is gone. Restate it once so they can catch a misread, then stop short of moving anything until the moves are approved."
+              : "They passed on the question. That is an answer too, so I should not re-ask or nudge, just say plainly that nothing changed.",
+          );
+          emit("ai:done", undefined);
+          return {
+            messages: [...incoming, { role: "assistant", content: reply }],
+            pending: [],
+            question: null,
+            final_text: reply,
+            done: true,
+          } as AgentResult as T;
+        }
         const approvals =
           (args.approvals as { id: string; approved: boolean }[]) ?? [];
         const approved = approvals.filter((a) => a.approved).length;
@@ -1058,6 +1263,7 @@ function mockBridge(): Bridge {
         return {
           messages,
           pending: [],
+          question: null,
           final_text,
           done: true,
         } as AgentResult as T;

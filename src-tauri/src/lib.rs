@@ -2,15 +2,18 @@ use fo_ai::organize::{self, Move};
 use fo_ai::{OpenRouter, ReasoningEffort};
 use fo_archive::ArchiveListing;
 use fo_chats::{derive_title, Chat, ChatSummary, Chats};
-use fo_dedup::{find_duplicates, find_similar_images, DupGroup, SimilarGroup};
+use fo_dedup::{find_duplicates, find_similar_images, DupGroup, ScanMode, SimilarGroup};
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
 use fo_rules::{match_rule, Rule, RuleAction, RuleFilter, Rules};
 use fo_search::{ContentHit, ExtStat, Index, SearchHit, SearchOpts};
 use fo_trash::{SkippedItem, Trash, TrashItem};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
@@ -21,7 +24,103 @@ struct AppState {
     trash: Mutex<Trash>,
     rules: Mutex<Rules>,
     chats: Mutex<Chats>,
-    watchers: Mutex<Vec<Watcher>>,
+    /// Live watchers keyed by the root they cover, so watching a root twice is
+    /// a no-op instead of a second set of duplicate events.
+    watchers: Mutex<HashMap<PathBuf, Watcher>>,
+    /// Cancellation flag for the long job currently running (a duplicate or
+    /// similar-image scan, or an index pass). `None` when nothing is running.
+    scan_cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// Hand a fresh cancellation token to a job that is about to start, replacing
+/// whatever the previous one left behind.
+fn begin_scan(state: &AppState) -> Arc<AtomicBool> {
+    let token = Arc::new(AtomicBool::new(false));
+    *state.scan_cancel.lock().unwrap() = Some(token.clone());
+    token
+}
+
+/// Retire a token when its job ends, but only while it is still the current
+/// one, so a job finishing late cannot disarm a newer job's cancel button.
+fn end_scan(state: &AppState, token: &Arc<AtomicBool>) {
+    let mut slot = state.scan_cancel.lock().unwrap();
+    if slot.as_ref().is_some_and(|t| Arc::ptr_eq(t, token)) {
+        *slot = None;
+    }
+}
+
+/// Ask the running scan or index pass to stop. Returns false when nothing is
+/// running. The job stops at its next file and comes back with `cancelled:
+/// true` rather than an error, so the UI can tell a stop from a clean finish.
+#[tauri::command]
+fn cancel_scan(state: State<AppState>) -> bool {
+    match state.scan_cancel.lock().unwrap().as_ref() {
+        Some(token) => {
+            token.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// At most one progress event per this many ms (~20/s). One event per file over
+/// tens of thousands of candidates floods the IPC channel and costs more than
+/// the work it is reporting on.
+const PROGRESS_INTERVAL_MS: u64 = 50;
+
+/// Rate limiter for progress events. Rayon workers share it, so the clock is an
+/// atomic instead of a lock.
+struct Throttle {
+    start: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Throttle {
+    fn new() -> Throttle {
+        Throttle {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+    /// Always true for the first and last file, so the UI gets a total up front
+    /// and a completed bar at the end; throttled in between.
+    fn ready(&self, done: usize, total: usize) -> bool {
+        if done <= 1 || done >= total {
+            return true;
+        }
+        let now = self.start.elapsed().as_millis() as u64;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= PROGRESS_INTERVAL_MS
+            && self
+                .last_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+}
+
+/// A scan that ran to the end or was stopped part way. `cancelled` is how the
+/// UI tells "found nothing" from "stopped before it could look"; the groups are
+/// whatever was confirmed before the stop, and are safe to act on either way.
+#[derive(serde::Serialize)]
+struct DupScan {
+    /// True number of groups, so the UI does not have to derive it before paging.
+    group_count: usize,
+    groups: Vec<DupGroup>,
+    cancelled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SimilarScan {
+    groups: Vec<SimilarGroup>,
+    cancelled: bool,
+}
+
+/// An index pass. `count` is what actually landed in the index, which is a real
+/// partial count when `cancelled` is set.
+#[derive(serde::Serialize)]
+struct IndexRun {
+    count: usize,
+    cancelled: bool,
 }
 
 const KEYRING_SERVICE: &str = "com.parham.fileorganizer";
@@ -214,57 +313,118 @@ fn search(
 }
 
 #[tauri::command]
-async fn index_folder(path: String, app: AppHandle) -> Result<usize, String> {
+async fn index_folder(path: String, app: AppHandle) -> Result<IndexRun, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = PathBuf::from(&path);
         let entries = fo_indexer::enumerate_best(&root).map_err(|e| e.to_string())?;
         let total = entries.len();
         let state = app.state::<AppState>();
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
+        // recorded before the first batch, so even a cancelled or failed pass
+        // leaves a root the user can remove the stray rows through
+        state
+            .index
+            .lock()
+            .unwrap()
+            .add_root(&root)
+            .map_err(|e| e.to_string())?;
         let mut done = 0usize;
+        let mut failed: Option<String> = None;
         for chunk in entries.chunks(2000) {
-            {
-                let mut idx = state.index.lock().unwrap();
-                idx.upsert_batch(chunk).map_err(|e| e.to_string())?;
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let written = state.index.lock().unwrap().upsert_batch(chunk);
+            if let Err(e) = written {
+                failed = Some(e.to_string());
+                break;
             }
             done += chunk.len();
-            let _ = app.emit(
-                "index:progress",
-                serde_json::json!({ "done": done, "total": total }),
-            );
+            if throttle.ready(done, total) {
+                let _ = app.emit(
+                    "index:progress",
+                    serde_json::json!({ "done": done, "total": total }),
+                );
+            }
         }
-        Ok(total)
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(IndexRun {
+                count: done,
+                cancelled,
+            }),
+        }
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn index_content(root: String, app: AppHandle) -> Result<usize, String> {
+async fn index_content(root: String, app: AppHandle) -> Result<IndexRun, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let entries = WalkdirSource
             .enumerate(&PathBuf::from(&root))
             .map_err(|e| e.to_string())?;
         let total = entries.len();
         let state = app.state::<AppState>();
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
         let mut indexed = 0usize;
         for (done, e) in entries.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             if let Ok(Some(body)) = fo_extract::extract_text(&e.path) {
                 let mut idx = state.index.lock().unwrap();
                 if idx.index_content(&e.path, &body).is_ok() {
                     indexed += 1;
                 }
             }
-            if done % 50 == 0 || done + 1 == total {
+            if throttle.ready(done + 1, total) {
                 let _ = app.emit(
                     "content:progress",
                     serde_json::json!({ "done": done + 1, "total": total }),
                 );
             }
         }
-        Ok(indexed)
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        Ok(IndexRun {
+            count: indexed,
+            cancelled,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn list_indexed_roots(state: State<AppState>) -> Result<Vec<String>, String> {
+    state
+        .index
+        .lock()
+        .unwrap()
+        .list_roots()
+        .map_err(|e| e.to_string())
+}
+
+/// Forget a folder: drop its rows from the search index, its indexed body text,
+/// and its entry in the indexed-roots list. Returns how many file rows went.
+///
+/// THIS DELETES NOTHING ON DISK. Not one file is moved, trashed or removed; the
+/// folder and everything in it is left exactly as it is and simply stops
+/// showing up in search until it is indexed again.
+#[tauri::command]
+fn remove_indexed_root(path: String, state: State<AppState>) -> Result<usize, String> {
+    state
+        .index
+        .lock()
+        .unwrap()
+        .remove_under(&PathBuf::from(path))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -289,15 +449,29 @@ fn list_archive(path: String, limit: Option<usize>) -> Result<ArchiveListing, St
 }
 
 #[tauri::command]
-fn start_watch(path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let root = PathBuf::from(&path);
+fn start_watch(path: String, app: AppHandle) -> Result<(), String> {
+    watch_root(&app, PathBuf::from(path))
+}
+
+/// Keep the index in step with `root`. Already-watched roots are a no-op, and a
+/// root that is not there (an unplugged drive) is an error the caller may ignore
+/// rather than something that stops the rest of the app.
+fn watch_root(app: &AppHandle, root: PathBuf) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!("{} is not available right now", root.display()));
+    }
+    let state = app.state::<AppState>();
+    let mut watchers = state.watchers.lock().unwrap();
+    if watchers.contains_key(&root) {
+        return Ok(());
+    }
     let handle = app.clone();
     let watcher = Watcher::watch(&root, move |ev| {
         apply_change(&handle, ev);
         let _ = handle.emit("index:changed", ());
     })
     .map_err(|e| e.to_string())?;
-    state.watchers.lock().unwrap().push(watcher);
+    watchers.insert(root, watcher);
     Ok(())
 }
 
@@ -308,9 +482,18 @@ fn apply_change(app: &AppHandle, ev: ChangeEvent) {
         ChangeEvent::Created(p) | ChangeEvent::Modified(p) => upsert_one(&mut idx, p),
         ChangeEvent::Removed(p) => {
             let _ = idx.remove_path(&p);
+            // body text outlives the file otherwise, and Contents search keeps
+            // offering a path that is gone
+            let _ = idx.remove_content(&p);
         }
         ChangeEvent::Renamed { from, to } => {
             let _ = idx.remove_path(&from);
+            let _ = idx.remove_content(&from);
+            // a folder renamed outside the app leaves every indexed child
+            // sitting on a dead path, so repoint the whole subtree
+            if to.is_dir() {
+                let _ = idx.reparent(&from, &to);
+            }
             upsert_one(&mut idx, to);
         }
     }
@@ -329,49 +512,127 @@ fn upsert_one(idx: &mut Index, p: PathBuf) {
     let _ = idx.upsert_batch(std::slice::from_ref(&entry));
 }
 
+/// `mode` is "sequential" for one reader at a time (an external HDD, where
+/// concurrent readers thrash the head) or "auto" for all cores (SSD/NVMe).
+/// Defaults to auto.
 #[tauri::command]
 async fn scan_duplicates(
     root: String,
     algo: String,
+    mode: Option<String>,
     app: AppHandle,
-) -> Result<Vec<DupGroup>, String> {
+) -> Result<DupScan, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let algo = match algo.as_str() {
             "sha256" => HashAlgo::Sha256,
             _ => HashAlgo::Blake3,
         };
+        let mode = ScanMode::from_label(mode.as_deref());
         let entries = WalkdirSource
             .enumerate(&PathBuf::from(&root))
             .map_err(|e| e.to_string())?;
-        let groups = find_duplicates(&entries, algo, |done, total| {
-            let _ = app.emit(
-                "dedup:progress",
-                serde_json::json!({ "done": done, "total": total }),
-            );
+        let state = app.state::<AppState>();
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
+        let groups = find_duplicates(&entries, algo, mode, &cancel, |done, total| {
+            if throttle.ready(done, total) {
+                let _ = app.emit(
+                    "dedup:progress",
+                    serde_json::json!({ "done": done, "total": total }),
+                );
+            }
         });
-        Ok(groups)
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        Ok(DupScan {
+            group_count: groups.len(),
+            groups,
+            cancelled,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Duplicates across everything indexed, on every drive at once, with no
+/// filesystem walk: the index already knows every path and size, so the size
+/// stage is a query and only the survivors are ever read. `minSize` floors that
+/// query (default 1, i.e. everything). Files deleted since they were indexed
+/// fail to hash and drop out silently instead of failing the scan. `algo` and
+/// `mode` behave as in `scan_duplicates`.
+#[tauri::command]
+async fn scan_duplicates_indexed(
+    algo: Option<String>,
+    mode: Option<String>,
+    min_size: Option<i64>,
+    app: AppHandle,
+) -> Result<DupScan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let algo = match algo.as_deref() {
+            Some("sha256") => HashAlgo::Sha256,
+            _ => HashAlgo::Blake3,
+        };
+        let mode = ScanMode::from_label(mode.as_deref());
+        let state = app.state::<AppState>();
+        let entries = {
+            let idx = state.index.lock().unwrap();
+            idx.size_collision_candidates(min_size.unwrap_or(1))
+                .map_err(|e| e.to_string())?
+        };
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
+        let groups = find_duplicates(&entries, algo, mode, &cancel, |done, total| {
+            if throttle.ready(done, total) {
+                let _ = app.emit(
+                    "dedup:progress",
+                    serde_json::json!({ "done": done, "total": total }),
+                );
+            }
+        });
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        Ok(DupScan {
+            group_count: groups.len(),
+            groups,
+            cancelled,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// `mode` behaves as in `scan_duplicates`.
 #[tauri::command]
 async fn scan_similar_images(
     root: String,
     max_distance: Option<u32>,
+    mode: Option<String>,
     app: AppHandle,
-) -> Result<Vec<SimilarGroup>, String> {
+) -> Result<SimilarScan, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let entries = WalkdirSource
             .enumerate(&PathBuf::from(&root))
             .map_err(|e| e.to_string())?;
-        let groups = find_similar_images(&entries, max_distance.unwrap_or(10), |done, total| {
-            let _ = app.emit(
-                "similar:progress",
-                serde_json::json!({ "done": done, "total": total }),
-            );
-        });
-        Ok(groups)
+        let state = app.state::<AppState>();
+        let cancel = begin_scan(&state);
+        let throttle = Throttle::new();
+        let groups = find_similar_images(
+            &entries,
+            max_distance.unwrap_or(10),
+            ScanMode::from_label(mode.as_deref()),
+            &cancel,
+            |done, total| {
+                if throttle.ready(done, total) {
+                    let _ = app.emit(
+                        "similar:progress",
+                        serde_json::json!({ "done": done, "total": total }),
+                    );
+                }
+            },
+        );
+        let cancelled = cancel.load(Ordering::Relaxed);
+        end_scan(&state, &cancel);
+        Ok(SimilarScan { groups, cancelled })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -393,6 +654,7 @@ fn trash_files(
     let idx = state.index.lock().unwrap();
     for p in &bufs {
         let _ = idx.remove_path(p);
+        let _ = idx.remove_content(p);
     }
     Ok(op.id)
 }
@@ -417,6 +679,7 @@ fn reindex_after_move(idx: &mut Index, items: &[TrashItem]) {
         let from = PathBuf::from(&it.original_path);
         let to = PathBuf::from(&it.stored_path);
         let _ = idx.remove_path(&from);
+        let _ = idx.remove_content(&from);
         if it.is_dir {
             let _ = idx.reparent(&from, &to);
         } else {
@@ -433,6 +696,7 @@ fn reindex_moved(state: &State<AppState>, restored: &[(PathBuf, PathBuf)]) {
     let mut idx = state.index.lock().unwrap();
     for (_, stored) in restored {
         let _ = idx.remove_path(stored);
+        let _ = idx.remove_content(stored);
     }
     let targets: Vec<PathBuf> = restored.iter().map(|(t, _)| t.clone()).collect();
     let entries = stat_entries(&targets);
@@ -608,7 +872,9 @@ fn run_rule(id: String, state: State<AppState>) -> Result<RuleRun, String> {
             reindex_after_move(&mut idx, &op.items);
         } else {
             for it in &op.items {
-                let _ = idx.remove_path(&PathBuf::from(&it.original_path));
+                let p = PathBuf::from(&it.original_path);
+                let _ = idx.remove_path(&p);
+                let _ = idx.remove_content(&p);
             }
         }
     }
@@ -983,8 +1249,23 @@ pub fn run() {
                 trash: Mutex::new(trash),
                 rules: Mutex::new(rules),
                 chats: Mutex::new(chats),
-                watchers: Mutex::new(Vec::new()),
+                watchers: Mutex::new(HashMap::new()),
+                scan_cancel: Mutex::new(None),
             });
+            // Watchers do not survive a restart, so without this the index goes
+            // quietly stale until the user re-indexes by hand.
+            let handle = app.handle().clone();
+            let roots = handle
+                .state::<AppState>()
+                .index
+                .lock()
+                .unwrap()
+                .list_roots()
+                .unwrap_or_default();
+            for root in roots {
+                // an unplugged drive is skipped, never a failed startup
+                let _ = watch_root(&handle, PathBuf::from(root));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -995,10 +1276,14 @@ pub fn run() {
             index_folder,
             index_content,
             search_content,
+            list_indexed_roots,
+            remove_indexed_root,
             list_archive,
             start_watch,
             scan_duplicates,
+            scan_duplicates_indexed,
             scan_similar_images,
+            cancel_scan,
             trash_files,
             list_trash,
             restore_op,

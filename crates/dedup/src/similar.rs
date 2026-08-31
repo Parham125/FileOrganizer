@@ -1,10 +1,11 @@
+use crate::{in_pool, scan_pool, ScanMode};
 use fo_indexer::FileEntry;
 use image_hasher::{HasherConfig, ImageHash};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"];
 /// Guard against the O(n^2) pairwise pass on huge folders.
@@ -43,26 +44,39 @@ fn uf_find(parent: &mut [usize], mut i: usize) -> usize {
 /// Hashes in parallel (skipping files that fail to decode), then clusters with
 /// union-find. Each returned group has 2+ members and reports the largest
 /// pairwise distance inside it; groups are sorted by member count desc.
+///
+/// Raising `cancel` stops the hashing pass and clusters only what was already
+/// hashed; the caller reads the flag afterwards to tell that from a clean run.
 pub fn find_similar_images(
     entries: &[FileEntry],
     max_distance: u32,
+    mode: ScanMode,
+    cancel: &AtomicBool,
     progress: impl Fn(usize, usize) + Sync,
 ) -> Vec<SimilarGroup> {
-    let images: Vec<&FileEntry> = entries.iter().filter(|e| is_image(&e.path)).collect();
+    let mut images: Vec<&FileEntry> = entries.iter().filter(|e| is_image(&e.path)).collect();
     if images.len() > MAX_IMAGES {
         return Vec::new();
     }
+    // Decode in directory order so an HDD reads forward instead of seeking.
+    images.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     let total = images.len();
     let done = AtomicUsize::new(0);
-    let hashed: Vec<(PathBuf, ImageHash)> = images
-        .par_iter()
-        .filter_map(|e| {
-            let out = perceptual_hash(&e.path).ok().map(|h| (e.path.clone(), h));
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(n, total);
-            out
-        })
-        .collect();
+    let pool = scan_pool(mode);
+    let hashed: Vec<(PathBuf, ImageHash)> = in_pool(pool.as_ref(), || {
+        images
+            .par_iter()
+            .filter_map(|e| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let out = perceptual_hash(&e.path).ok().map(|h| (e.path.clone(), h));
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress(n, total);
+                out
+            })
+            .collect()
+    });
     let n = hashed.len();
     let mut parent: Vec<usize> = (0..n).collect();
     for i in 0..n {
@@ -130,7 +144,13 @@ mod tests {
         }
         other.save(dir.path().join("other.png")).unwrap();
         let entries = WalkdirSource.enumerate(dir.path()).unwrap();
-        let groups = find_similar_images(&entries, 10, |_, _| {});
+        let groups = find_similar_images(
+            &entries,
+            10,
+            ScanMode::Sequential,
+            &AtomicBool::new(false),
+            |_, _| {},
+        );
         assert_eq!(groups.len(), 1, "expected exactly one near-dup group");
         assert_eq!(groups[0].paths.len(), 2);
         let mut names: Vec<String> = groups[0]
@@ -140,5 +160,14 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["base.png", "near.jpg"]);
+        // cancelling before the first decode leaves nothing to cluster
+        let cancelled = find_similar_images(
+            &entries,
+            10,
+            ScanMode::Auto,
+            &AtomicBool::new(true),
+            |_, _| {},
+        );
+        assert!(cancelled.is_empty());
     }
 }

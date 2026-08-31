@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Walking a directory to size it stops here, so a pathological tree cannot
 /// stall an operation. The sum is then a floor, not an exact total.
 const WALK_LIMIT: usize = 100_000;
+
+/// Per-volume quarantine directory, sitting on the root of the drive the file
+/// already lives on, exactly as macOS (`.Trashes`) and Windows (`$Recycle.Bin`)
+/// do. Trashing is then a rename on that drive instead of a copy across to the
+/// system disk, which is both instant and free of system-disk space.
+const VOLUME_TRASH_DIR: &str = ".FileOrganizer-Trash";
 
 /// A quarantined file or folder that can be restored or purged.
 #[derive(Debug, Clone, Serialize)]
@@ -85,11 +92,28 @@ impl Trash {
         Ok(Trash { conn, trash_root })
     }
 
-    /// True only if `p` lives inside the quarantine root. Stored paths for
-    /// delete ops are built from `trash_root`; move/organize stored paths point
-    /// at real user files and never match this, so purge must never touch them.
+    /// True only if `p` sits inside a quarantine this app owns: the app-data
+    /// trash, or a `.FileOrganizer-Trash` on the root of the volume that still
+    /// holds `p`. An arbitrary path is never accepted, so a folder a user
+    /// happened to name `.FileOrganizer-Trash` halfway down a tree is refused
+    /// along with everything else. Stored paths for move/organize ops point at
+    /// real user files and match neither, so purge must never touch them.
     fn is_in_quarantine(&self, p: &Path) -> bool {
-        p.starts_with(&self.trash_root)
+        // `ancestors()` reads a path literally, so ".." would let a crafted
+        // journal row point back out of a quarantine directory and have us
+        // delete something outside it. Paths we write never contain "..".
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        if p != self.trash_root && p.starts_with(&self.trash_root) {
+            return true;
+        }
+        match volume_quarantine(p).and_then(|q| q.parent()) {
+            Some(vr) => volume_root(p).is_some_and(|v| v == vr),
+            None => false,
+        }
     }
 
     pub fn trash_files(
@@ -100,8 +124,9 @@ impl Trash {
     ) -> Result<TrashOp> {
         let op_id = nanoid::nanoid!(20);
         let now = now_ns();
-        let op_dir = self.trash_root.join(&op_id);
-        fs::create_dir_all(&op_dir)?;
+        let app_op_dir = self.trash_root.join(&op_id);
+        fs::create_dir_all(&app_op_dir)?;
+        let trash_vol = volume_root(&self.trash_root);
         self.conn.execute(
             "INSERT INTO operations (id, kind, created_ns, note) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![op_id, "delete", now, note],
@@ -130,6 +155,44 @@ impl Trash {
             } else {
                 meta.len() as i64
             };
+            // Quarantine on the file's own drive when that is not the app-data
+            // one: the move stays a rename instead of copying the whole file
+            // across to the system disk.
+            let vol = volume_root(path);
+            let mut op_dir = app_op_dir.clone();
+            let mut cross_volume = false;
+            match &vol {
+                Some(v) if trash_vol.as_ref() != Some(v) => {
+                    let per_volume = v.join(VOLUME_TRASH_DIR).join(&op_id);
+                    // read-only media or a permission wall lands here, and the
+                    // app-data trash takes over
+                    if fs::create_dir_all(&per_volume).is_ok() {
+                        op_dir = per_volume;
+                    } else {
+                        cross_volume = true;
+                    }
+                }
+                None => cross_volume = trash_vol.is_some(),
+                _ => {}
+            }
+            // The fallback copies rather than renames, so refuse up front when
+            // the system disk cannot hold the file instead of failing mid-copy.
+            // A check that cannot run at all is simply not run.
+            if cross_volume && !is_dir {
+                if let Some(free) = free_space(&self.trash_root) {
+                    if size as u64 > free {
+                        skipped.push(skip(
+                            path,
+                            &format!(
+                                "needs {}, only {} free on the app's disk",
+                                human_bytes(size as u64),
+                                human_bytes(free)
+                            ),
+                        ));
+                        continue;
+                    }
+                }
+            }
             let stored_name = format!("{}_{}", nanoid::nanoid!(20), filename);
             let stored_path = op_dir.join(&stored_name);
             if move_path(path, &stored_path, is_dir).is_err() {
@@ -393,18 +456,27 @@ impl Trash {
             let rows = stmt.query_map([op_id], |r| r.get(0))?;
             rows.collect::<Result<Vec<String>, _>>()?
         };
+        // One op can span several drives, so collect every quarantine it landed
+        // in rather than assuming the app-data one.
+        let mut op_dirs: HashSet<PathBuf> = HashSet::new();
+        op_dirs.insert(self.trash_root.join(op_id));
         for path in &stored {
-            if self.is_in_quarantine(Path::new(path)) {
-                remove_stored(Path::new(path));
+            let p = Path::new(path);
+            if self.is_in_quarantine(p) {
+                remove_stored(p);
+                if let Some(q) = volume_quarantine(p) {
+                    op_dirs.insert(q.join(op_id));
+                }
             }
         }
         self.conn
             .execute("DELETE FROM trash_items WHERE op_id = ?1", [op_id])?;
         self.conn
             .execute("DELETE FROM operations WHERE id = ?1", [op_id])?;
-        let op_dir = self.trash_root.join(op_id);
-        if op_dir.exists() {
-            let _ = fs::remove_dir_all(&op_dir);
+        for op_dir in op_dirs {
+            if op_dir.exists() {
+                let _ = fs::remove_dir_all(&op_dir);
+            }
         }
         Ok(())
     }
@@ -466,10 +538,31 @@ impl Trash {
     }
 
     pub fn empty(&self) -> Result<()> {
+        let stored: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT stored_path FROM trash_items")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<Vec<String>, _>>()?
+        };
+        // Sweep every quarantine that has rows, not only the app-data one; a
+        // drive that is not mounted right now simply has nothing to remove.
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        roots.insert(self.trash_root.clone());
+        for s in &stored {
+            let p = Path::new(s);
+            if self.is_in_quarantine(p) {
+                remove_stored(p);
+                if let Some(q) = volume_quarantine(p) {
+                    roots.insert(q.to_path_buf());
+                }
+            }
+        }
         self.conn
             .execute_batch("DELETE FROM trash_items; DELETE FROM operations;")?;
-        if self.trash_root.exists() {
-            for entry in fs::read_dir(&self.trash_root)?.flatten() {
+        for root in roots {
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
                     let _ = fs::remove_dir_all(&p);
@@ -482,6 +575,23 @@ impl Trash {
     }
 
     fn restore_move(&self, stored: &Path, original: &Path, is_dir: bool) -> Result<PathBuf> {
+        // A quarantine on another volume is gone the moment that drive is
+        // unplugged. Say which drive instead of dropping the entry, which would
+        // lose the only copy of the file for good.
+        if !stored.exists() {
+            if let Some(q) = volume_quarantine(stored) {
+                if !q.exists() {
+                    return Err(anyhow!(
+                        "the drive holding this file is not connected ({}), reconnect it and try again",
+                        q.parent().unwrap_or(q).display()
+                    ));
+                }
+            }
+            return Err(anyhow!(
+                "the quarantined copy is no longer at {}",
+                stored.display()
+            ));
+        }
         if let Some(parent) = original.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -500,6 +610,109 @@ fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// The `.FileOrganizer-Trash` directory a per-volume stored path sits inside,
+/// or `None` for anything else. `p` itself is never the answer, so the
+/// quarantine directory is not treated as being inside itself.
+fn volume_quarantine(p: &Path) -> Option<&Path> {
+    p.ancestors()
+        .skip(1)
+        .find(|a| a.file_name().is_some_and(|n| n == VOLUME_TRASH_DIR))
+}
+
+/// The mount point `path` lives on. Walks up while the device id matches, which
+/// needs no extra dependency and stops exactly at the mount boundary.
+#[cfg(unix)]
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // a path that does not exist yet has no device of its own, so start from
+    // the nearest ancestor that does
+    let mut current = path;
+    let dev = loop {
+        match fs::metadata(current) {
+            Ok(m) => break m.dev(),
+            Err(_) => current = current.parent()?,
+        }
+    };
+    let mut root = current.to_path_buf();
+    while let Some(parent) = root.parent() {
+        match fs::metadata(parent) {
+            Ok(m) if m.dev() == dev => root = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    Some(root)
+}
+
+#[cfg(windows)]
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // MAX_PATH + 1, what GetVolumePathNameW documents as always sufficient
+    let mut buf = [0u16; 261];
+    unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut buf).ok()? };
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buf[..len])))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_root(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Bytes still writable on the volume holding `dir`, or `None` when the platform
+/// cannot say. Callers treat `None` as "do not check", never as "no space".
+#[cfg(unix)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut free = 0u64;
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free), None, None).ok()? };
+    Some(free)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Byte count a user can read at a glance, for skip reasons naming real numbers.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", n)
+    } else {
+        format!("{:.1} {}", v, UNITS[unit])
+    }
 }
 
 fn skip(path: &Path, reason: &str) -> SkippedItem {
@@ -923,6 +1136,125 @@ mod tests {
         drop(trash);
         let trash = Trash::open(data).unwrap();
         assert_eq!(trash.list(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn purge_refuses_a_crafted_stored_path_outside_every_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let victim = dir.path().join("precious.txt");
+        fs::write(&victim, b"precious").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        assert!(!trash.is_in_quarantine(&victim));
+        // a folder a user named like the quarantine, but not on a volume root
+        let lookalike = dir
+            .path()
+            .join("anywhere")
+            .join(VOLUME_TRASH_DIR)
+            .join("op")
+            .join("x.txt");
+        assert!(!trash.is_in_quarantine(&lookalike));
+        // climbing back out of a real quarantine with ".." must not be accepted
+        let escape = data
+            .join("trash")
+            .join("op")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("precious.txt");
+        assert!(!trash.is_in_quarantine(&escape));
+        // rows pointing at a real user file, as a tampered journal would look
+        let conn = Connection::open(data.join("trash.db")).unwrap();
+        conn.execute(
+            "INSERT INTO operations (id, kind, created_ns, note) VALUES ('op1', 'delete', 1, NULL)",
+            [],
+        )
+        .unwrap();
+        let stored = victim.to_string_lossy().to_string();
+        let add = |id: &str| {
+            conn.execute(
+                "INSERT INTO trash_items (id, op_id, original_path, stored_path, size, deleted_ns, reason, restored, is_dir)
+                 VALUES (?1, 'op1', '/x/precious.txt', ?2, 8, 1, 'manual', 0, 0)",
+                rusqlite::params![id, stored],
+            )
+            .unwrap();
+        };
+        add("i1");
+        trash.purge_item("i1").unwrap();
+        assert!(victim.exists());
+        add("i2");
+        trash.purge_before(i64::MAX).unwrap();
+        assert!(victim.exists());
+        add("i3");
+        trash.purge_to_cap(0).unwrap();
+        assert!(victim.exists());
+        add("i4");
+        trash.purge_op("op1").unwrap();
+        assert!(victim.exists());
+        conn.execute(
+            "INSERT INTO operations (id, kind, created_ns, note) VALUES ('op1', 'delete', 1, NULL)",
+            [],
+        )
+        .unwrap();
+        add("i5");
+        trash.empty().unwrap();
+        assert!(
+            victim.exists(),
+            "no purge path may delete a file outside the quarantine"
+        );
+        assert!(trash.list(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_refuses_when_the_quarantine_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let a = src.join("a.txt");
+        fs::write(&a, b"aaa").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        let op = trash.trash_files(&[a.clone()], "manual", None).unwrap();
+        // the quarantine directory disappears out from under the journal
+        fs::remove_dir_all(data.join("trash")).unwrap();
+        let err = trash.restore_item(&op.items[0].id).unwrap_err().to_string();
+        assert!(err.contains("no longer at"), "{err}");
+        // the entry survives instead of being silently dropped or marked done
+        let rows = trash.list(None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].restored);
+        assert!(!a.exists());
+        // a quarantine on an unmounted drive names the drive
+        let offline = dir
+            .path()
+            .join("Volumes-stub")
+            .join(VOLUME_TRASH_DIR)
+            .join("op")
+            .join("a.txt");
+        let err = trash
+            .restore_move(&offline, &a, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not connected"), "{err}");
+        assert!(err.contains("Volumes-stub"), "{err}");
+    }
+
+    #[test]
+    fn human_bytes_reads_like_a_size() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(4_509_715_660), "4.2 GB");
+        assert_eq!(human_bytes(1_181_116_006), "1.1 GB");
+    }
+
+    #[test]
+    fn volume_root_is_an_ancestor_that_contains_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"a").unwrap();
+        let root = volume_root(&file).expect("a real file must resolve to a volume");
+        assert!(file.starts_with(&root), "{root:?}");
+        // resolving works for a path that does not exist yet
+        assert_eq!(volume_root(&dir.path().join("nope/deeper.txt")), Some(root));
     }
 
     #[test]

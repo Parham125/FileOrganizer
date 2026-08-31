@@ -66,6 +66,18 @@ export const IconCheck = (p: P) => (
   </S>
 );
 
+export const IconStop = (p: P) => (
+  <S {...p}>
+    <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" />
+  </S>
+);
+
+export const IconChevron = (p: P) => (
+  <S {...p}>
+    <path d="m9 5 7 7-7 7" />
+  </S>
+);
+
 export const IconX = (p: P) => (
   <S {...p}>
     <path d="M6 6l12 12M18 6 6 18" />
@@ -162,6 +174,14 @@ export const IconBranch = (p: P) => (
     <path d="M6 5v14" />
     <circle cx="17" cy="7" r="2.5" />
     <path d="M6 12h5a4 4 0 0 0 4-4v-.5" />
+  </S>
+);
+
+export const IconAsk = (p: P) => (
+  <S {...p}>
+    <path d="M20 15a3 3 0 0 1-3 3H9l-4 3v-3H5a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3z" />
+    <path d="M9.4 9a2.2 2.2 0 0 1 4.2.8c0 1.5-2.1 1.7-2.1 3" />
+    <path d="M11.5 14.6h.01" />
   </S>
 );
 

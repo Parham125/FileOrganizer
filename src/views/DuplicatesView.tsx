@@ -1,10 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatSize } from "../format";
-import type { DupGroup, HashAlgo, Progress } from "../types";
+import { useScanMode } from "../store";
+import type {
+  DupGroup,
+  DupScanResult,
+  HashAlgo,
+  Progress,
+  ScanMode,
+} from "../types";
 import PageHeader from "../components/PageHeader";
-import ProgressBar from "../components/ProgressBar";
+import ScanModePicker from "../components/ScanModePicker";
+import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
+import StoppedNotice from "../components/StoppedNotice";
 import SimilarImagesView from "./SimilarImagesView";
 import { IconCheck, IconFolder } from "../components/icons";
 
@@ -12,6 +21,7 @@ type DupMode = "exact" | "similar";
 
 export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
   const [mode, setMode] = useState<DupMode>("exact");
+  const [scanMode, setScanMode] = useScanMode();
   return (
     <div className="space-y-6">
       <PageHeader
@@ -33,13 +43,27 @@ export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
           />
         }
       />
-      {mode === "exact" ? <ExactDuplicates algo={algo} /> : <SimilarImagesView />}
+      {mode === "exact" ? (
+        <ExactDuplicates
+          algo={algo}
+          scanMode={scanMode}
+          onScanMode={setScanMode}
+        />
+      ) : (
+        <SimilarImagesView scanMode={scanMode} onScanMode={setScanMode} />
+      )}
     </div>
   );
 }
 
+// A drive can produce thousands of sets. Rendering them all stalls the view, so
+// the list is paged while the selection stays whole underneath it.
+const PER_PAGE = 25;
+
 function shortestPath(paths: string[]): string {
-  return [...paths].sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+  return [...paths].sort(
+    (a, b) => a.length - b.length || a.localeCompare(b),
+  )[0];
 }
 
 // Selected == the copies to remove. Default keeps the shortest path and
@@ -49,15 +73,36 @@ function defaultRemoval(g: DupGroup): Set<string> {
   return new Set(g.paths.filter((p) => p !== keep));
 }
 
-function ExactDuplicates({ algo }: { algo: HashAlgo }) {
+function ExactDuplicates({
+  algo,
+  scanMode,
+  onScanMode,
+}: {
+  algo: HashAlgo;
+  scanMode: ScanMode;
+  onScanMode: (m: ScanMode) => void;
+}) {
   const [root, setRoot] = useState<string | null>(null);
   const [groups, setGroups] = useState<DupGroup[] | null>(null);
+  // What the scan actually confirmed, which is what the reader is told. It can
+  // run ahead of groups.length when the backend caps what it hands over.
+  const [groupCount, setGroupCount] = useState(0);
+  const [page, setPage] = useState(0);
   const [selection, setSelection] = useState<Record<string, Set<string>>>({});
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
+  const [stopped, setStopped] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Turning the page puts the reader at the top of the new one, not halfway
+  // down where the last one ended.
+  function goPage(next: number) {
+    setPage(next);
+    listRef.current?.scrollIntoView({ block: "start" });
+  }
 
   useEffect(() => {
     const un = listen<Progress>("dedup:progress", (p) => setProgress(p));
@@ -78,14 +123,22 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
     }
     setError("");
     setDone("");
+    setStopped(false);
     setScanning(true);
     setProgress({ done: 0, total: 0 });
     setGroups(null);
+    setPage(0);
     try {
-      const res = await invoke<DupGroup[]>("scan_duplicates", { root, algo });
-      setGroups(res);
+      const res = await invoke<DupScanResult>("scan_duplicates", {
+        root,
+        algo,
+        mode: scanMode,
+      });
+      setGroups(res.groups);
+      setGroupCount(res.group_count);
+      setStopped(res.cancelled);
       const sel: Record<string, Set<string>> = {};
-      for (const g of res) sel[g.hash] = defaultRemoval(g);
+      for (const g of res.groups) sel[g.hash] = defaultRemoval(g);
       setSelection(sel);
     } catch (e) {
       setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -106,23 +159,32 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
     setDone("");
   }
 
+  // Every page at once: the selection spans the whole result, so the running
+  // totals have to as well, or paging away would look like losing the picks.
   const summary = useMemo(() => {
     let count = 0;
     let bytes = 0;
     let invalid = 0;
+    let sets = 0;
     for (const g of groups ?? []) {
       const rm = selection[g.hash]?.size ?? 0;
       if (rm >= g.paths.length) invalid++;
+      if (rm > 0) sets++;
       count += rm;
       bytes += rm * g.size;
     }
-    return { count, bytes, invalid };
+    return { count, bytes, invalid, sets };
   }, [groups, selection]);
 
   const wasted = useMemo(
     () => (groups ?? []).reduce((s, g) => s + g.size * (g.paths.length - 1), 0),
     [groups],
   );
+
+  const listed = groups?.length ?? 0;
+  const pages = Math.max(1, Math.ceil(listed / PER_PAGE));
+  const from = page * PER_PAGE;
+  const shown = groups ? groups.slice(from, from + PER_PAGE) : [];
 
   async function trashSelected() {
     const paths: string[] = [];
@@ -136,6 +198,10 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         .map((g) => ({ ...g, paths: g.paths.filter((p) => !removed.has(p)) }))
         .filter((g) => g.paths.length > 1);
       setGroups(remaining);
+      setGroupCount(remaining.length);
+      setPage((p) =>
+        Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
+      );
       const sel: Record<string, Set<string>> = {};
       for (const g of remaining) sel[g.hash] = defaultRemoval(g);
       setSelection(sel);
@@ -144,33 +210,42 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         `Moved ${paths.length} ${paths.length === 1 ? "file" : "files"} to Trash and reclaimed ${formatSize(summary.bytes)}. Restore anytime from Trash.`,
       );
     } catch (e) {
-      setError(`Could not move files: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
+      );
       setConfirming(false);
     }
   }
 
   return (
     <div className="space-y-6 pb-28">
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <button
-          type="button"
-          onClick={chooseFolder}
-          className="inline-flex items-center gap-2 rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink transition-colors hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
-        >
-          <IconFolder className="h-4 w-4" />
-          {root ? "Change folder" : "Pick folder"}
-        </button>
-        <button
-          type="button"
-          onClick={scan}
-          disabled={scanning || !root}
-          className="inline-flex items-center gap-2 rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
-        >
-          {scanning && (
-            <span className="h-4 w-4 rounded-full border-2 border-white/40 border-t-white fo-spin" />
-          )}
-          {scanning ? "Scanning" : "Scan"}
-        </button>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <ScanModePicker
+          value={scanMode}
+          onChange={onScanMode}
+          disabled={scanning}
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={chooseFolder}
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink transition-colors hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+          >
+            <IconFolder className="h-4 w-4" />
+            {root ? "Change folder" : "Pick folder"}
+          </button>
+          <button
+            type="button"
+            onClick={scan}
+            disabled={scanning || !root}
+            className="inline-flex items-center gap-2 rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
+          >
+            {scanning && (
+              <span className="h-4 w-4 rounded-full border-2 border-white/40 border-t-white fo-spin" />
+            )}
+            {scanning ? "Scanning" : "Scan"}
+          </button>
+        </div>
       </div>
 
       {root && (
@@ -180,10 +255,14 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         </p>
       )}
 
-      {progress && (
-        <div className="rounded-lg border border-line bg-surface p-4">
-          <ProgressBar progress={progress} label="Hashing files" />
-        </div>
+      {progress && <ScanProgress progress={progress} label="Hashing files" />}
+
+      {stopped && (
+        <StoppedNotice>
+          {groups && groups.length > 0
+            ? "You stopped this scan. These are only the sets it had confirmed by then, so there may be more duplicates in that folder."
+            : "You stopped this scan before it confirmed any duplicates. Scan again to look through the whole folder."}
+        </StoppedNotice>
       )}
 
       {error && (
@@ -198,7 +277,7 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         </div>
       )}
 
-      {groups && groups.length === 0 && !done && (
+      {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
           <p className="text-sm font-medium text-ink">No duplicates found</p>
           <p className="mt-1 text-sm text-ink-soft">
@@ -211,8 +290,10 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         <>
           <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
             <span className="text-ink-soft">
-              <span className="font-semibold text-ink">{groups.length}</span>{" "}
-              duplicate {groups.length === 1 ? "set" : "sets"}
+              <span className="font-semibold text-ink">
+                {groupCount.toLocaleString()}
+              </span>{" "}
+              duplicate {groupCount === 1 ? "set" : "sets"}
             </span>
             <span className="text-ink-soft">
               <span className="font-mono font-semibold text-ochre">
@@ -220,10 +301,31 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
               </span>{" "}
               can be reclaimed
             </span>
+            {stopped && (
+              <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
+                Partial list
+              </span>
+            )}
+            {groupCount > listed && (
+              <span className="text-xs text-ink-faint">
+                The first {listed.toLocaleString()} are listed below
+              </span>
+            )}
           </div>
 
-          <div className="space-y-4">
-            {groups.map((g) => {
+          {pages > 1 && (
+            <Pager
+              page={page}
+              pages={pages}
+              from={from + 1}
+              to={from + shown.length}
+              total={listed}
+              onPage={goPage}
+            />
+          )}
+
+          <div ref={listRef} className="space-y-4">
+            {shown.map((g) => {
               const sel = selection[g.hash] ?? new Set<string>();
               const keeping = g.paths.length - sel.size;
               return (
@@ -236,8 +338,8 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
                       <Stack n={g.paths.length} />
                       <div>
                         <div className="text-sm font-medium text-ink">
-                          {g.paths.length} identical copies, {formatSize(g.size)}{" "}
-                          each
+                          {g.paths.length} identical copies,{" "}
+                          {formatSize(g.size)} each
                         </div>
                         <div className="font-mono text-xs text-ink-faint">
                           {g.hash}
@@ -246,9 +348,14 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
                     </div>
                     <div className="text-right text-xs">
                       <div className="text-ink-soft">
-                        Keep <span className="font-semibold text-ink">{keeping}</span>,
-                        remove{" "}
-                        <span className="font-semibold text-brick">{sel.size}</span>
+                        Keep{" "}
+                        <span className="font-semibold text-ink">
+                          {keeping}
+                        </span>
+                        , remove{" "}
+                        <span className="font-semibold text-brick">
+                          {sel.size}
+                        </span>
                       </div>
                       <div className="font-mono text-ochre">
                         frees {formatSize(g.size * (g.paths.length - 1))}
@@ -304,6 +411,17 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
               );
             })}
           </div>
+
+          {pages > 1 && (
+            <Pager
+              page={page}
+              pages={pages}
+              from={from + 1}
+              to={from + shown.length}
+              total={listed}
+              onPage={goPage}
+            />
+          )}
         </>
       )}
 
@@ -313,8 +431,8 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
             {confirming ? (
               <>
                 <span className="text-sm text-ink">
-                  Move {summary.count} {summary.count === 1 ? "file" : "files"} to
-                  Trash and reclaim{" "}
+                  Move {summary.count} {summary.count === 1 ? "file" : "files"}{" "}
+                  to Trash and reclaim{" "}
                   <span className="font-mono text-ochre">
                     {formatSize(summary.bytes)}
                   </span>
@@ -340,8 +458,20 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
             ) : (
               <>
                 <span className="text-sm text-ink-soft">
-                  <span className="font-semibold text-ink">{summary.count}</span>{" "}
-                  selected to remove,{" "}
+                  <span className="font-semibold text-ink">
+                    {summary.count.toLocaleString()}
+                  </span>{" "}
+                  selected to remove
+                  {pages > 1 && (
+                    <>
+                      {" across "}
+                      <span className="font-semibold text-ink">
+                        {summary.sets.toLocaleString()}
+                      </span>
+                      {summary.sets === 1 ? " set" : " sets"}
+                    </>
+                  )}
+                  ,{" "}
                   <span className="font-mono text-ochre">
                     {formatSize(summary.bytes)}
                   </span>{" "}
@@ -349,8 +479,8 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
                   {summary.invalid > 0 && (
                     <span className="text-brick">
                       {" "}
-                      · {summary.invalid} set{summary.invalid === 1 ? "" : "s"} would
-                      keep no copy
+                      · {summary.invalid} set{summary.invalid === 1 ? "" : "s"}{" "}
+                      would keep no copy
                     </span>
                   )}
                 </span>
@@ -368,6 +498,63 @@ function ExactDuplicates({ algo }: { algo: HashAlgo }) {
         </div>
       )}
     </div>
+  );
+}
+
+// Paging over the sets. The range and the total sit next to the controls so the
+// reader always knows how much of the scan they are looking at.
+function Pager({
+  page,
+  pages,
+  from,
+  to,
+  total,
+  onPage,
+}: {
+  page: number;
+  pages: number;
+  from: number;
+  to: number;
+  total: number;
+  onPage: (p: number) => void;
+}) {
+  const step =
+    "rounded-md border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink transition-colors hover:border-line-strong disabled:opacity-40 disabled:hover:border-line focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal";
+  return (
+    <nav
+      aria-label="Duplicate set pages"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-line bg-surface px-4 py-2.5"
+    >
+      <p className="text-xs text-ink-soft">
+        Sets{" "}
+        <span className="font-mono text-ink">
+          {from.toLocaleString()}-{to.toLocaleString()}
+        </span>{" "}
+        of <span className="font-mono text-ink">{total.toLocaleString()}</span>
+      </p>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => onPage(page - 1)}
+          disabled={page === 0}
+          className={step}
+        >
+          Previous
+        </button>
+        <span className="text-xs text-ink-soft" aria-live="polite">
+          Page <span className="font-mono text-ink">{page + 1}</span> of{" "}
+          <span className="font-mono text-ink">{pages}</span>
+        </span>
+        <button
+          type="button"
+          onClick={() => onPage(page + 1)}
+          disabled={page >= pages - 1}
+          className={step}
+        >
+          Next
+        </button>
+      </div>
+    </nav>
   );
 }
 

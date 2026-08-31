@@ -43,6 +43,22 @@ pub struct Index {
     conn: Connection,
 }
 
+/// A directory as `(prefix, like_pattern)`. The prefix ends on the path
+/// separator so `/tmp/data` can never match a sibling named `/tmp/data2`, and
+/// the pattern escapes the LIKE wildcards a real path may contain.
+fn dir_prefix(dir: &Path) -> (String, String) {
+    let sep = std::path::MAIN_SEPARATOR;
+    let prefix = format!("{}{}", dir.to_string_lossy().trim_end_matches(sep), sep);
+    let like = format!(
+        "{}%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    (prefix, like)
+}
+
 impl Index {
     pub fn open(db_path: &Path) -> Result<Index> {
         let conn = Connection::open(db_path)?;
@@ -73,7 +89,12 @@ impl Index {
             END;
             CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
                 path, body, tokenize='porter unicode61'
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS roots (
+                path TEXT PRIMARY KEY,
+                added_ns INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS files_size_idx ON files(size);",
         )?;
         Ok(Index { conn })
     }
@@ -135,18 +156,8 @@ impl Index {
     /// index follows the move instead of keeping dead paths until a re-index.
     /// Returns how many rows were repointed.
     pub fn reparent(&self, old_dir: &Path, new_dir: &Path) -> Result<usize> {
-        let old = old_dir.to_string_lossy().to_string();
-        let new = new_dir.to_string_lossy().to_string();
-        let sep = std::path::MAIN_SEPARATOR;
-        let old_prefix = format!("{}{}", old.trim_end_matches(sep), sep);
-        let new_prefix = format!("{}{}", new.trim_end_matches(sep), sep);
-        let like = format!(
-            "{}%",
-            old_prefix
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
+        let (old_prefix, like) = dir_prefix(old_dir);
+        let (new_prefix, _) = dir_prefix(new_dir);
         let n = self.conn.execute(
             "UPDATE files SET path = ?1 || substr(path, ?2)
              WHERE path LIKE ?3 ESCAPE '\\'",
@@ -157,8 +168,88 @@ impl Index {
         Ok(n)
     }
 
+    /// Forget everything indexed under `dir`: file rows, their body text, and
+    /// the folder's own entry in `roots` (plus any root nested inside it).
+    ///
+    /// This deletes index rows only. No file on disk is read, moved or removed.
+    /// Returns how many file rows were dropped.
+    pub fn remove_under(&self, dir: &Path) -> Result<usize> {
+        let (prefix, like) = dir_prefix(dir);
+        let root = prefix
+            .trim_end_matches(std::path::MAIN_SEPARATOR)
+            .to_string();
+        let n = self
+            .conn
+            .execute("DELETE FROM files WHERE path LIKE ?1 ESCAPE '\\'", [&like])?;
+        self.conn.execute(
+            "DELETE FROM content_fts WHERE path LIKE ?1 ESCAPE '\\'",
+            [&like],
+        )?;
+        self.conn.execute(
+            "DELETE FROM roots WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+            rusqlite::params![root, like],
+        )?;
+        Ok(n)
+    }
+
+    /// Record a folder as an indexed root so the UI can list what is in the
+    /// index and offer to remove it again. Re-indexing the same folder is a
+    /// no-op rather than a duplicate row.
+    pub fn add_root(&self, dir: &Path) -> Result<()> {
+        let path = dir
+            .to_string_lossy()
+            .trim_end_matches(std::path::MAIN_SEPARATOR)
+            .to_string();
+        let added_ns = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO roots (path, added_ns) VALUES (?1, ?2) ON CONFLICT(path) DO NOTHING",
+            rusqlite::params![path, added_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Indexed roots, oldest first.
+    pub fn list_roots(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM roots ORDER BY added_ns, path")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<String>, _>>()?)
+    }
+
+    /// Indexed files whose size is shared by at least one other indexed file:
+    /// exactly the survivors of a duplicate scan's size stage, across every root
+    /// in the index rather than one folder. Files smaller than `min_size` are
+    /// left out. Ordered by path so the caller reads the disk in directory
+    /// order. Backed by `files_size_idx`, since this runs over the whole index.
+    pub fn size_collision_candidates(&self, min_size: i64) -> Result<Vec<FileEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, modified_ns FROM files
+             WHERE size >= ?1 AND size IN (
+                SELECT size FROM files WHERE size >= ?1 GROUP BY size HAVING COUNT(*) > 1
+             ) ORDER BY path",
+        )?;
+        let rows = stmt.query_map([min_size], |r| {
+            let path: String = r.get(0)?;
+            let size: i64 = r.get(1)?;
+            let modified_ns: Option<i64> = r.get(2)?;
+            Ok(FileEntry {
+                path: std::path::PathBuf::from(path),
+                size: size.max(0) as u64,
+                modified: modified_ns
+                    .and_then(|ns| u64::try_from(ns).ok())
+                    .map(|ns| UNIX_EPOCH + std::time::Duration::from_nanos(ns)),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn clear(&self) -> Result<()> {
-        self.conn.execute_batch("DELETE FROM files;")?;
+        self.conn
+            .execute_batch("DELETE FROM files; DELETE FROM content_fts; DELETE FROM roots;")?;
         Ok(())
     }
 
@@ -345,6 +436,88 @@ mod tests {
         assert!(paths.iter().all(|p| !p.contains("عکس‌ها")), "{paths:?}");
         // a sibling outside the moved folder is untouched
         assert!(paths.iter().any(|p| p.ends_with("keep.txt")), "{paths:?}");
+    }
+
+    #[test]
+    fn remove_under_forgets_one_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // data2 is a string prefix collision with data: only the separator
+        // anchoring keeps it out of the delete
+        let data = dir.path().join("data");
+        let data2 = dir.path().join("data2");
+        let nested = data.join("عکس‌ها");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&data2).unwrap();
+        fs::write(data.join("a.txt"), b"a").unwrap();
+        fs::write(nested.join("b.txt"), b"bb").unwrap();
+        fs::write(data2.join("c.txt"), b"ccc").unwrap();
+        let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
+        for root in [&data, &data2] {
+            let entries = WalkdirSource.enumerate(root).unwrap();
+            idx.upsert_batch(&entries).unwrap();
+            idx.add_root(root).unwrap();
+        }
+        idx.index_content(&data.join("a.txt"), "platypus notes")
+            .unwrap();
+        idx.index_content(&data2.join("c.txt"), "wombat notes")
+            .unwrap();
+        assert_eq!(idx.count().unwrap(), 3);
+        assert_eq!(idx.list_roots().unwrap().len(), 2);
+        assert_eq!(idx.remove_under(&data).unwrap(), 2);
+        let paths: Vec<String> = idx
+            .search("", &SearchOpts::default())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].ends_with("data2/c.txt"), "{paths:?}");
+        // the removed root's body text goes with it, the sibling's stays
+        assert!(idx.search_content("platypus", 20).unwrap().is_empty());
+        assert_eq!(idx.search_content("wombat", 20).unwrap().len(), 1);
+        assert_eq!(
+            idx.list_roots().unwrap(),
+            vec![data2.to_string_lossy().to_string()]
+        );
+        // and nothing was touched on disk
+        assert!(data.join("a.txt").exists());
+        assert!(nested.join("b.txt").exists());
+    }
+
+    #[test]
+    fn size_candidates_find_duplicates_across_separate_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        // two trees standing in for two drives, each holding the same file
+        let one = dir.path().join("drive-one");
+        let two = dir.path().join("drive-two");
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        fs::write(one.join("report.pdf"), b"identical contents here").unwrap();
+        fs::write(two.join("copy.pdf"), b"identical contents here").unwrap();
+        fs::write(one.join("unique.txt"), b"nothing else looks like this").unwrap();
+        let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
+        for root in [&one, &two] {
+            let entries = WalkdirSource.enumerate(root).unwrap();
+            idx.upsert_batch(&entries).unwrap();
+            idx.add_root(root).unwrap();
+        }
+        // the lone file drops out at the size stage, the pair survives it
+        let candidates = idx.size_collision_candidates(1).unwrap();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(candidates.iter().all(|e| !e.path.ends_with("unique.txt")));
+        let groups = fo_dedup::find_duplicates(
+            &candidates,
+            fo_hasher::HashAlgo::Blake3,
+            fo_dedup::ScanMode::Auto,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_, _| {},
+        );
+        assert_eq!(groups.len(), 1);
+        let mut paths = groups[0].paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec![one.join("report.pdf"), two.join("copy.pdf")]);
+        // a floor above both files leaves nothing to hash
+        assert!(idx.size_collision_candidates(1_000_000).unwrap().is_empty());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
-import type { ContentHit, Progress } from "../types";
-import ProgressBar from "../components/ProgressBar";
+import type { ContentHit, IndexResult, Progress } from "../types";
+import ScanProgress from "../components/ScanProgress";
+import StoppedNotice from "../components/StoppedNotice";
 import { IconCheck, IconFolder, IconSearch } from "../components/icons";
 
 // Snippets arrive with matched terms wrapped in square brackets, like
@@ -37,12 +38,18 @@ export default function ContentSearchView() {
   const [indexing, setIndexing] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState("");
+  const [stopped, setStopped] = useState("");
 
   const queryRef = useRef(query);
   queryRef.current = query;
+  // How far the pass got, so a stopped run can say what it actually read.
+  const readRef = useRef(0);
 
   useEffect(() => {
-    const un = listen<Progress>("content:progress", (p) => setProgress(p));
+    const un = listen<Progress>("content:progress", (p) => {
+      readRef.current = p.done;
+      setProgress(p);
+    });
     return () => {
       un.then((f) => f());
     };
@@ -76,15 +83,23 @@ export default function ContentSearchView() {
 
   async function indexContents() {
     setError("");
+    setStopped("");
     const dir = await pickFolder();
     if (!dir) return;
     setIndexing(true);
     setProgress({ done: 0, total: 0 });
+    readRef.current = 0;
     try {
-      const n = await invoke<number>("index_content", { root: dir });
-      setCount(n);
+      const res = await invoke<IndexResult>("index_content", { root: dir });
+      setCount(res.count);
+      if (res.cancelled)
+        setStopped(
+          `You stopped indexing after ${readRef.current.toLocaleString()} ${readRef.current === 1 ? "document" : "documents"}. Those are searchable now. Index the folder again to read the rest.`,
+        );
     } catch (e) {
-      setError(`Could not index contents: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not index contents: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setIndexing(false);
       setProgress(null);
@@ -119,15 +134,19 @@ export default function ContentSearchView() {
           ) : (
             <IconFolder className="h-4 w-4" />
           )}
-          {indexing ? "Indexing" : count == null ? "Index contents" : "Index another folder"}
+          {indexing
+            ? "Indexing"
+            : count == null
+              ? "Index contents"
+              : "Index another folder"}
         </button>
       </div>
 
       {progress && (
-        <div className="rounded-lg border border-line bg-surface p-4">
-          <ProgressBar progress={progress} label="Reading documents" />
-        </div>
+        <ScanProgress progress={progress} label="Reading documents" />
       )}
+
+      {stopped && <StoppedNotice>{stopped}</StoppedNotice>}
 
       {error && (
         <div className="rounded-md border border-brick/40 bg-brick-soft px-3.5 py-2.5 text-sm text-brick">
@@ -142,7 +161,9 @@ export default function ContentSearchView() {
           onChange={(e) => setQuery(e.target.value)}
           disabled={notIndexed}
           placeholder={
-            notIndexed ? "Index a folder to search inside documents" : "Search words inside your documents"
+            notIndexed
+              ? "Index a folder to search inside documents"
+              : "Search words inside your documents"
           }
           className="w-full rounded-md border border-line bg-surface py-2.5 pl-10 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 disabled:cursor-not-allowed disabled:opacity-60"
         />
@@ -151,7 +172,9 @@ export default function ContentSearchView() {
       <div className="overflow-hidden rounded-lg border border-line bg-surface">
         {notIndexed ? (
           <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
-            <p className="text-sm font-medium text-ink">Contents not indexed yet</p>
+            <p className="text-sm font-medium text-ink">
+              Contents not indexed yet
+            </p>
             <p className="max-w-xs text-sm text-ink-soft">
               Index a folder once to read the text inside its documents. After
               that, searches run instantly.
@@ -160,7 +183,9 @@ export default function ContentSearchView() {
         ) : hits.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
             <p className="text-sm font-medium text-ink">
-              {searched ? "No matches inside your documents" : "Search your indexed documents"}
+              {searched
+                ? "No matches inside your documents"
+                : "Search your indexed documents"}
             </p>
             <p className="max-w-xs text-sm text-ink-soft">
               {searched
@@ -176,7 +201,9 @@ export default function ContentSearchView() {
               return (
                 <li
                   key={h.path}
-                  onDoubleClick={() => invoke("open_file", { path: h.path }).catch(() => {})}
+                  onDoubleClick={() =>
+                    invoke("open_file", { path: h.path }).catch(() => {})
+                  }
                   className="border-b border-line/70 px-4 py-3 last:border-b-0 hover:bg-surface-2/40"
                 >
                   <div className="truncate text-sm font-semibold text-ink">

@@ -10,6 +10,21 @@ export function formatSize(bytes: number): string {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return `${k.toFixed(k >= 10 ? 0 : 1)}k`;
+}
+
+// Turn costs land in fractions of a cent, so the precision follows the number
+// rather than rounding a real charge away to zero.
+export function formatCost(usd: number): string {
+  if (usd === 0) return "$0";
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(4)}`;
+}
+
 export function formatDate(ns: number | null): string {
   if (!ns) return "";
   const d = new Date(ns / 1e6);

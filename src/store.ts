@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import type { Theme } from "./types";
+import type { ScanMode, Theme } from "./types";
 
 export function useLocalStorageState<T>(
   key: string,
@@ -30,6 +30,12 @@ export function useLocalStorageState<T>(
 // Shared across Settings, Organize, and Assistant so they all use one model.
 export function useModel(): [string, (m: string) => void] {
   return useLocalStorageState<string>("fo.model", "anthropic/claude-sonnet-5");
+}
+
+// Shared by both duplicate scans, since the disk they read does not change
+// between them.
+export function useScanMode(): [ScanMode, (m: ScanMode) => void] {
+  return useLocalStorageState<ScanMode>("fo.scanMode", "auto");
 }
 
 export function useTheme(): [Theme, (t: Theme) => void, boolean] {

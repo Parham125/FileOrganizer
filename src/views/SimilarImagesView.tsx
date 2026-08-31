@@ -1,11 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
-import type { Progress, SimilarGroup } from "../types";
-import ProgressBar from "../components/ProgressBar";
+import type {
+  Progress,
+  ScanMode,
+  SimilarGroup,
+  SimilarScanResult,
+} from "../types";
+import ScanModePicker from "../components/ScanModePicker";
+import ScanProgress from "../components/ScanProgress";
+import StoppedNotice from "../components/StoppedNotice";
 import { IconCheck, IconFolder } from "../components/icons";
 
 function shortestPath(paths: string[]): string {
-  return [...paths].sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+  return [...paths].sort(
+    (a, b) => a.length - b.length || a.localeCompare(b),
+  )[0];
 }
 
 // Selected == the copies to remove. Default keeps the shortest path and
@@ -15,7 +24,13 @@ function defaultRemoval(paths: string[]): Set<string> {
   return new Set(paths.filter((p) => p !== keep));
 }
 
-export default function SimilarImagesView() {
+export default function SimilarImagesView({
+  scanMode,
+  onScanMode,
+}: {
+  scanMode: ScanMode;
+  onScanMode: (m: ScanMode) => void;
+}) {
   const [root, setRoot] = useState<string | null>(null);
   const [groups, setGroups] = useState<SimilarGroup[] | null>(null);
   const [selection, setSelection] = useState<Record<number, Set<string>>>({});
@@ -24,6 +39,7 @@ export default function SimilarImagesView() {
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
+  const [stopped, setStopped] = useState(false);
 
   useEffect(() => {
     const un = listen<Progress>("similar:progress", (p) => setProgress(p));
@@ -44,17 +60,20 @@ export default function SimilarImagesView() {
     }
     setError("");
     setDone("");
+    setStopped(false);
     setScanning(true);
     setProgress({ done: 0, total: 0 });
     setGroups(null);
     try {
-      const res = await invoke<SimilarGroup[]>("scan_similar_images", {
+      const res = await invoke<SimilarScanResult>("scan_similar_images", {
         root,
         maxDistance: 8,
+        mode: scanMode,
       });
-      setGroups(res);
+      setGroups(res.groups);
+      setStopped(res.cancelled);
       const sel: Record<number, Set<string>> = {};
-      res.forEach((g, i) => (sel[i] = defaultRemoval(g.paths)));
+      res.groups.forEach((g, i) => (sel[i] = defaultRemoval(g.paths)));
       setSelection(sel);
     } catch (e) {
       setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -107,14 +126,22 @@ export default function SimilarImagesView() {
         `Moved ${paths.length} ${paths.length === 1 ? "photo" : "photos"} to Trash. Restore anytime from Trash.`,
       );
     } catch (e) {
-      setError(`Could not move files: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
+      );
       setConfirming(false);
     }
   }
 
   return (
     <div className="space-y-6 pb-28">
-      <div className="flex flex-wrap items-center justify-end gap-2">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <ScanModePicker
+          value={scanMode}
+          onChange={onScanMode}
+          disabled={scanning}
+        />
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={chooseFolder}
@@ -134,6 +161,7 @@ export default function SimilarImagesView() {
             )}
             {scanning ? "Scanning" : "Scan"}
           </button>
+        </div>
       </div>
 
       {root && (
@@ -144,9 +172,15 @@ export default function SimilarImagesView() {
       )}
 
       {progress && (
-        <div className="rounded-lg border border-line bg-surface p-4">
-          <ProgressBar progress={progress} label="Comparing images" />
-        </div>
+        <ScanProgress progress={progress} label="Comparing images" />
+      )}
+
+      {stopped && (
+        <StoppedNotice>
+          {groups && groups.length > 0
+            ? "You stopped this scan. These are only the sets it had compared by then, so there may be more look-alikes in that folder."
+            : "You stopped this scan before it found any look-alikes. Scan again to compare the whole folder."}
+        </StoppedNotice>
       )}
 
       {error && (
@@ -161,7 +195,7 @@ export default function SimilarImagesView() {
         </div>
       )}
 
-      {groups && groups.length === 0 && !done && (
+      {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
           <p className="text-sm font-medium text-ink">No look-alikes found</p>
           <p className="mt-1 text-sm text-ink-soft">
@@ -172,9 +206,16 @@ export default function SimilarImagesView() {
 
       {groups && groups.length > 0 && (
         <>
-          <div className="text-sm text-ink-soft">
-            <span className="font-semibold text-ink">{groups.length}</span>{" "}
-            {groups.length === 1 ? "set" : "sets"} of look-alike photos
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-ink-soft">
+            <span>
+              <span className="font-semibold text-ink">{groups.length}</span>{" "}
+              {groups.length === 1 ? "set" : "sets"} of look-alike photos
+            </span>
+            {stopped && (
+              <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
+                Partial list
+              </span>
+            )}
           </div>
 
           <div className="space-y-4">
@@ -203,9 +244,12 @@ export default function SimilarImagesView() {
                       </div>
                     </div>
                     <div className="text-right text-xs text-ink-soft">
-                      Keep <span className="font-semibold text-ink">{keeping}</span>,
+                      Keep{" "}
+                      <span className="font-semibold text-ink">{keeping}</span>,
                       remove{" "}
-                      <span className="font-semibold text-brick">{sel.size}</span>
+                      <span className="font-semibold text-brick">
+                        {sel.size}
+                      </span>
                     </div>
                   </div>
                   <ul>
@@ -266,8 +310,9 @@ export default function SimilarImagesView() {
             {confirming ? (
               <>
                 <span className="text-sm text-ink">
-                  Move {summary.count} {summary.count === 1 ? "photo" : "photos"}{" "}
-                  to Trash? You can restore them later.
+                  Move {summary.count}{" "}
+                  {summary.count === 1 ? "photo" : "photos"} to Trash? You can
+                  restore them later.
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -289,7 +334,9 @@ export default function SimilarImagesView() {
             ) : (
               <>
                 <span className="text-sm text-ink-soft">
-                  <span className="font-semibold text-ink">{summary.count}</span>{" "}
+                  <span className="font-semibold text-ink">
+                    {summary.count}
+                  </span>{" "}
                   selected to remove
                   {summary.invalid > 0 && (
                     <span className="text-brick">

@@ -1,17 +1,21 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
+import { formatCost, formatTokens } from "../format";
 import type {
   AgentResult,
   AgentStep,
+  AgentUsage,
   Chat,
   ChatMessage,
   ChatSummary,
   PendingAction,
+  PendingQuestion,
 } from "../types";
 import PageHeader from "../components/PageHeader";
 import Markdown from "../components/Markdown";
 import ChatHistory from "../components/ChatHistory";
 import {
+  IconAsk,
   IconAssistant,
   IconBranch,
   IconCheck,
@@ -88,7 +92,19 @@ type Turn = { token: number; chat: string | null };
 const EXAMPLES = [
   "Find duplicate photos in Downloads",
   "What's taking up the most space?",
+  "Sort my receipts into a folder",
 ];
+
+// Usage arrives one reading per model step, so a turn is the sum of its steps.
+// cost stays null until some step actually reports one.
+function addUsage(a: AgentUsage | null, b: AgentUsage): AgentUsage {
+  return {
+    prompt_tokens: (a?.prompt_tokens ?? 0) + b.prompt_tokens,
+    completion_tokens: (a?.completion_tokens ?? 0) + b.completion_tokens,
+    cached_tokens: (a?.cached_tokens ?? 0) + b.cached_tokens,
+    cost: b.cost == null ? (a?.cost ?? null) : (a?.cost ?? 0) + b.cost,
+  };
+}
 
 // The exact files a proposed action would touch, so the user approves with full
 // knowledge of what is affected (not just the summary line).
@@ -194,6 +210,165 @@ function ReasoningNote({
   );
 }
 
+// What the turn spent. The quietest thing on the rail on purpose: no marker, no
+// color, no border. It is here for the reader who goes looking for it.
+function UsageNote({ usage, rail }: { usage: AgentUsage; rail?: boolean }) {
+  const parts = [
+    `${formatTokens(usage.prompt_tokens)} in`,
+    `${formatTokens(usage.completion_tokens)} out`,
+  ];
+  if (usage.cached_tokens > 0)
+    parts.push(`${formatTokens(usage.cached_tokens)} from cache`);
+  if (usage.cost != null) parts.push(formatCost(usage.cost));
+  return (
+    <p
+      className={
+        "font-mono text-[11px] leading-relaxed text-ink-faint " +
+        (rail ? "" : "px-1")
+      }
+    >
+      {parts.join(" · ")}
+    </p>
+  );
+}
+
+// The model asking the reader something. It authorizes nothing, so it stays on
+// the turn rail in the conversation's own teal, keeps the question as its
+// headline, and says outright that answering touches no files. The approval
+// card is the opposite: detached from the rail, in ochre, and worded as consent.
+function QuestionCard({
+  question,
+  onAnswer,
+}: {
+  question: PendingQuestion;
+  onAnswer: (value: string) => void;
+}) {
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [text, setText] = useState("");
+  const multi = question.multi_select;
+  const typed = text.trim();
+  // In single-select the options and the free-text box are one choice between
+  // them, so answering in one place clears the other instead of quietly
+  // ranking them. Multi-select adds the typed answer to the picks.
+  const value = multi
+    ? [...chosen, typed].filter(Boolean).join(", ")
+    : (chosen[0] ?? typed);
+  function pick(label: string) {
+    if (!multi) {
+      setText("");
+      setChosen([label]);
+      return;
+    }
+    setChosen((prev) =>
+      prev.includes(label) ? prev.filter((x) => x !== label) : [...prev, label],
+    );
+  }
+  return (
+    <div className="overflow-hidden rounded-lg border border-teal-line bg-surface">
+      <div className="flex items-start gap-2.5 border-b border-teal-line bg-teal-soft/60 px-4 py-3">
+        <IconAsk className="mt-0.5 h-4 w-4 shrink-0 text-teal" />
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-ink">{question.question}</p>
+          {multi && question.options.length > 0 && (
+            <p className="mt-1 text-xs text-ink-soft">Pick as many as apply.</p>
+          )}
+        </div>
+      </div>
+      {question.options.length > 0 && (
+        <ul>
+          {question.options.map((o) => {
+            const on = chosen.includes(o.label);
+            return (
+              <li key={o.label}>
+                <label className="flex cursor-pointer items-start gap-3 border-b border-line px-4 py-2.5 hover:bg-surface-2/50">
+                  <span
+                    className={
+                      "mt-0.5 grid h-4 w-4 shrink-0 place-items-center border transition-colors " +
+                      (multi ? "rounded-[3px] " : "rounded-full ") +
+                      (on
+                        ? "border-teal bg-teal text-white"
+                        : "border-line-strong bg-surface")
+                    }
+                  >
+                    <input
+                      type={multi ? "checkbox" : "radio"}
+                      name={`q-${question.id}`}
+                      checked={on}
+                      onChange={() => pick(o.label)}
+                      className="sr-only"
+                    />
+                    {on &&
+                      (multi ? (
+                        <IconCheck className="h-3 w-3" />
+                      ) : (
+                        <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                      ))}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm text-ink">{o.label}</span>
+                    {o.description && (
+                      <span className="mt-0.5 block text-xs text-ink-soft">
+                        {o.description}
+                      </span>
+                    )}
+                  </span>
+                </label>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {question.allow_text && (
+        <div className="border-b border-line px-4 py-3">
+          <label htmlFor={`ans-${question.id}`} className="sr-only">
+            Answer in your own words
+          </label>
+          <input
+            id={`ans-${question.id}`}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              if (!multi) setChosen([]);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && value) onAnswer(value);
+            }}
+            placeholder={
+              question.options.length > 0
+                ? "Or answer in your own words"
+                : "Type your answer"
+            }
+            className="w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-faint focus:border-teal focus:ring-2 focus:ring-teal/30"
+          />
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+        <span className="text-xs text-ink-soft">
+          Answering changes nothing on disk.
+        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onAnswer("")}
+            className="rounded-md border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition-colors hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+          >
+            Skip
+          </button>
+          <button
+            type="button"
+            onClick={() => onAnswer(value)}
+            disabled={!value}
+            className="inline-flex items-center gap-1.5 rounded-md bg-teal px-3.5 py-1.5 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          >
+            <IconSend className="h-3.5 w-3.5" />
+            Send answer
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Bubble({
   text,
   tail,
@@ -224,18 +399,26 @@ function TurnGroup({
   pieces,
   stream,
   waiting,
+  asking,
   pondering,
   reasoning,
   reasoningLive,
+  usage,
 }: {
   pieces: Piece[];
   stream?: string;
   waiting?: boolean;
+  asking?: boolean;
   pondering?: boolean;
   reasoning?: string;
   reasoningLive?: boolean;
+  usage?: AgentUsage | null;
 }) {
-  const extras = (stream ? 1 : 0) + (waiting ? 1 : 0) + (pondering ? 1 : 0);
+  const extras =
+    (stream ? 1 : 0) +
+    (waiting ? 1 : 0) +
+    (asking ? 1 : 0) +
+    (pondering ? 1 : 0);
   const rail = pieces.length + extras + (reasoning ? 1 : 0) > 1;
   const last = extras === 0 ? pieces.length - 1 : -1;
   return (
@@ -267,6 +450,9 @@ function TurnGroup({
       {waiting && (
         <ActivityNote live rail={rail} label="Waiting on your go-ahead" />
       )}
+      {asking && (
+        <ActivityNote live rail={rail} label="Waiting on your answer" />
+      )}
       {stream ? <Bubble streaming text={stream} tail={false} /> : null}
       {pondering && (
         <div
@@ -279,6 +465,7 @@ function TurnGroup({
           Thinking
         </div>
       )}
+      {usage ? <UsageNote usage={usage} rail={rail} /> : null}
     </div>
   );
 }
@@ -305,6 +492,12 @@ export default function AssistantView({
   const [reasoned, setReasoned] = useState<Record<string, string>>({});
   const [live, setLive] = useState<Piece[]>([]);
   const [awaiting, setAwaiting] = useState(false);
+  const [question, setQuestion] = useState<PendingQuestion | null>(null);
+  const [asking, setAsking] = useState(false);
+  // What the turn in flight has spent so far, and what every resolved turn
+  // spent, kept under the group key that turn produced (same as reasoning).
+  const [usage, setUsage] = useState<AgentUsage | null>(null);
+  const [usages, setUsages] = useState<Record<string, AgentUsage>>({});
   const [editIndex, setEditIndex] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [forking, setForking] = useState(false);
@@ -327,6 +520,8 @@ export default function AssistantView({
   const bufRef = useRef("");
   // Same contract as bufRef, on its own channel: bare fragments in arrival order.
   const reasonRef = useRef("");
+  // Usage adds up across the steps of one turn before it is ever displayed.
+  const usageRef = useRef<AgentUsage | null>(null);
   const stickRef = useRef(true);
   const lastTopRef = useRef(0);
   // Every turn carries a token. Switching chats or starting a new one bumps it,
@@ -385,7 +580,16 @@ export default function AssistantView({
           });
         } else if (step.kind === "awaiting_approval") {
           setAwaiting(true);
+        } else if (step.kind === "question") {
+          setAsking(true);
         }
+      }),
+    );
+    keep(
+      listen<AgentUsage>("ai:usage", (u) => {
+        if (!liveRef.current) return;
+        usageRef.current = addUsage(usageRef.current, u);
+        setUsage(usageRef.current);
       }),
     );
     keep(
@@ -410,11 +614,13 @@ export default function AssistantView({
   }, [
     messages,
     pending,
+    question,
     thinking,
     stream,
     reasoning,
     live,
     awaiting,
+    asking,
     editIndex,
   ]);
 
@@ -448,14 +654,18 @@ export default function AssistantView({
   function startTurn(): Turn {
     bufRef.current = "";
     reasonRef.current = "";
+    usageRef.current = null;
     setStream("");
     setReasoning("");
+    setUsage(null);
     setLive([]);
     setAwaiting(false);
+    setAsking(false);
     setThinking(true);
     setError("");
     setSaveError("");
     setPending([]);
+    setQuestion(null);
     setEditIndex(null);
     stickRef.current = true;
     liveRef.current = true;
@@ -469,11 +679,16 @@ export default function AssistantView({
     liveRef.current = false;
     bufRef.current = "";
     reasonRef.current = "";
+    usageRef.current = null;
     setStream("");
     setReasoning("");
     setReasoned({});
+    setUsage(null);
+    setUsages({});
     setLive([]);
     setAwaiting(false);
+    setAsking(false);
+    setQuestion(null);
     setThinking(false);
   }
 
@@ -484,21 +699,33 @@ export default function AssistantView({
       liveRef.current = false;
       bufRef.current = "";
       const thought = reasonRef.current;
+      const spent = usageRef.current;
       reasonRef.current = "";
+      usageRef.current = null;
       setStream("");
       setReasoning("");
-      // Hand the working to the group the resolved transcript put it in, so it
-      // stays reachable under the answer it produced.
-      if (thought) {
+      setUsage(null);
+      // Hand the working and the meter to the group the resolved transcript put
+      // them in, so both stay reachable under the answer they produced. A turn
+      // that continues an existing group adds to what that group already spent.
+      if (thought || spent) {
         const key = [...groupMessages(r.messages)]
           .reverse()
           .find((g) => g.kind === "assistant")?.key;
-        if (key) setReasoned((prev) => ({ ...prev, [key]: thought }));
+        if (key && thought)
+          setReasoned((prev) => ({ ...prev, [key]: thought }));
+        if (key && spent)
+          setUsages((prev) => ({
+            ...prev,
+            [key]: addUsage(prev[key] ?? null, spent),
+          }));
       }
       setLive([]);
       setAwaiting(false);
+      setAsking(false);
       setMessages(r.messages);
       setPending(r.pending);
+      setQuestion(r.question);
       setDone(r.done);
       setApprovals(Object.fromEntries(r.pending.map((p) => [p.id, true])));
     }
@@ -624,10 +851,13 @@ export default function AssistantView({
       liveRef.current = false;
       bufRef.current = "";
       reasonRef.current = "";
+      usageRef.current = null;
       setStream("");
       setReasoning("");
+      setUsage(null);
       setLive([]);
       setAwaiting(false);
+      setAsking(false);
       setNeedsKey(/no api key/i.test(msg));
       setError(msg);
     } finally {
@@ -688,10 +918,13 @@ export default function AssistantView({
       liveRef.current = false;
       bufRef.current = "";
       reasonRef.current = "";
+      usageRef.current = null;
       setStream("");
       setReasoning("");
+      setUsage(null);
       setLive([]);
       setAwaiting(false);
+      setAsking(false);
       setNeedsKey(/no api key/i.test(msg));
       setError(msg);
     } finally {
@@ -718,10 +951,50 @@ export default function AssistantView({
       liveRef.current = false;
       bufRef.current = "";
       reasonRef.current = "";
+      usageRef.current = null;
       setStream("");
       setReasoning("");
+      setUsage(null);
       setLive([]);
       setAwaiting(false);
+      setAsking(false);
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (turn.token === turnRef.current) setThinking(false);
+    }
+  }
+
+  // The question belongs to the turn that raised it. Answering opens a new turn,
+  // which bumps the token, so a second press or a question from a chat the
+  // reader has left cannot be answered into this one. An empty value is the
+  // dismissal the backend turns into an explicit "user dismissed".
+  async function submitAnswer(value: string) {
+    const q = question;
+    if (!q || thinking) return;
+    const turn = startTurn();
+    try {
+      const r = await invoke<AgentResult>("ai_agent_continue", {
+        messages,
+        approvals: [],
+        answers: [{ id: q.id, value }],
+        model,
+      });
+      endTurn(r, turn);
+    } catch (e) {
+      if (turn.token !== turnRef.current) return;
+      liveRef.current = false;
+      bufRef.current = "";
+      reasonRef.current = "";
+      usageRef.current = null;
+      setStream("");
+      setReasoning("");
+      setUsage(null);
+      setLive([]);
+      setAwaiting(false);
+      setAsking(false);
+      // The answer never reached the model, so put the question back rather
+      // than leaving the reader with nothing to answer.
+      setQuestion(q);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (turn.token === turnRef.current) setThinking(false);
@@ -853,6 +1126,7 @@ export default function AssistantView({
                       key={g.key}
                       pieces={g.pieces}
                       reasoning={reasoned[g.key]}
+                      usage={usages[g.key]}
                     />
                   ) : editIndex === g.index ? (
                     <div key={g.index} className="flex justify-end">
@@ -929,15 +1203,28 @@ export default function AssistantView({
                     pieces={live}
                     stream={stream}
                     waiting={awaiting}
+                    asking={asking}
                     reasoning={reasoning}
                     reasoningLive
+                    usage={usage}
                     pondering={
                       !stream &&
                       !awaiting &&
+                      !asking &&
                       !reasoning &&
                       live.every((p) => p.kind !== "tool" || p.done)
                     }
                   />
+                )}
+
+                {!done && question && !thinking && (
+                  <div className="border-l border-teal-line pl-3.5">
+                    <QuestionCard
+                      key={question.id}
+                      question={question}
+                      onAnswer={submitAnswer}
+                    />
+                  </div>
                 )}
 
                 {!done && pending.length > 0 && !thinking && (

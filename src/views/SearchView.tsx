@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatDate, formatSize } from "../format";
-import type { Progress, SearchHit } from "../types";
+import type { IndexResult, Progress, SearchHit } from "../types";
 import PageHeader from "../components/PageHeader";
-import ProgressBar from "../components/ProgressBar";
+import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
+import StoppedNotice from "../components/StoppedNotice";
 import ContentSearchView from "./ContentSearchView";
 import {
   IconCheck,
+  IconChevron,
   IconFolder,
   IconReveal,
   IconSearch,
@@ -77,11 +79,19 @@ function FilenameSearch({
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState("");
+  const [stopped, setStopped] = useState("");
+  const [roots, setRoots] = useState<string[]>([]);
+  const [showRoots, setShowRoots] = useState(false);
+  const [confirmRoot, setConfirmRoot] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [note, setNote] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const parentRef = useRef<HTMLDivElement>(null);
 
   const stateRef = useRef({ query, ext, minIdx });
   stateRef.current = { query, ext, minIdx };
+  // How far the pass got, so a stopped run can say what it actually indexed.
+  const readRef = useRef(0);
 
   const runSearch = useCallback(async () => {
     const s = stateRef.current;
@@ -103,7 +113,10 @@ function FilenameSearch({
   }, []);
 
   useEffect(() => {
-    const un1 = listen<Progress>("index:progress", (p) => setProgress(p));
+    const un1 = listen<Progress>("index:progress", (p) => {
+      readRef.current = p.done;
+      setProgress(p);
+    });
     const un2 = listen("index:changed", () => runSearch());
     return () => {
       un1.then((f) => f());
@@ -118,20 +131,64 @@ function FilenameSearch({
 
   async function addFolder() {
     setError("");
+    setStopped("");
     const dir = await pickFolder();
     if (!dir) return;
     setBusy(true);
     setProgress({ done: 0, total: 0 });
+    readRef.current = 0;
     try {
-      const total = await invoke<number>("index_folder", { path: dir });
-      await invoke("start_watch", { path: dir });
-      onIndexed(total);
+      const res = await invoke<IndexResult>("index_folder", { path: dir });
+      // A half-indexed folder should not be watched, the watcher would keep a
+      // partial picture of it fresh and look complete.
+      if (!res.cancelled) await invoke("start_watch", { path: dir });
+      else
+        setStopped(
+          `You stopped indexing after ${readRef.current.toLocaleString()} ${readRef.current === 1 ? "file" : "files"}. Those are searchable now. Add the folder again to index the rest.`,
+        );
+      onIndexed(res.count);
+      await refreshRoots();
       await runSearch();
     } catch (e) {
-      setError(`Could not index folder: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not index folder: ${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       setBusy(false);
       setProgress(null);
+    }
+  }
+
+  const refreshRoots = useCallback(async () => {
+    try {
+      setRoots(await invoke<string[]>("list_indexed_roots"));
+    } catch {
+      // keep the last known list rather than blanking the panel
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshRoots();
+  }, [refreshRoots]);
+
+  async function removeRoot(path: string) {
+    setError("");
+    setRemoving(path);
+    try {
+      const rows = await invoke<number>("remove_indexed_root", { path });
+      setConfirmRoot(null);
+      setNote(
+        `Forgot ${rows.toLocaleString()} ${rows === 1 ? "file" : "files"} from ${path}. Nothing was deleted from your disk.`,
+      );
+      await refreshRoots();
+      onIndexed(await invoke<number>("index_stats"));
+      await runSearch();
+    } catch (e) {
+      setError(
+        `Could not remove folder: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      setRemoving(null);
     }
   }
 
@@ -158,7 +215,9 @@ function FilenameSearch({
     try {
       await invoke("reveal_file", { path });
     } catch (e) {
-      setError(`Could not reveal file: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not reveal file: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -166,7 +225,9 @@ function FilenameSearch({
     try {
       await invoke("open_file", { path });
     } catch (e) {
-      setError(`Could not open file: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not open file: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -178,7 +239,9 @@ function FilenameSearch({
       setSelected(new Set());
       await runSearch();
     } catch (e) {
-      setError(`Could not move files: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -191,7 +254,25 @@ function FilenameSearch({
 
   return (
     <div className={"space-y-6" + (selected.size > 0 ? " pb-24" : "")}>
-      <div className="flex flex-wrap items-center justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            setShowRoots(!showRoots);
+            setConfirmRoot(null);
+            setNote("");
+          }}
+          aria-expanded={showRoots}
+          className="-ml-2 inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-medium text-ink-soft transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+        >
+          <IconChevron
+            className={
+              "h-3.5 w-3.5 transition-transform " +
+              (showRoots ? "rotate-90" : "")
+            }
+          />
+          Indexed folders ({roots.length})
+        </button>
         <button
           type="button"
           onClick={addFolder}
@@ -207,11 +288,81 @@ function FilenameSearch({
         </button>
       </div>
 
-      {progress && (
-        <div className="rounded-lg border border-line bg-surface p-4">
-          <ProgressBar progress={progress} label="Indexing folder" />
+      {showRoots && (
+        <div className="overflow-hidden rounded-lg border border-line bg-surface">
+          {roots.length === 0 ? (
+            <div className="px-6 py-10 text-center">
+              <p className="text-sm font-medium text-ink">
+                No folders indexed yet
+              </p>
+              <p className="mt-1 text-sm text-ink-soft">
+                Add a folder to build your searchable index.
+              </p>
+            </div>
+          ) : (
+            <ul>
+              {roots.map((p) => (
+                <li
+                  key={p}
+                  className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-line/70 px-4 py-2.5 last:border-b-0"
+                >
+                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-soft">
+                    {p}
+                  </span>
+                  {confirmRoot === p ? (
+                    <div className="flex w-full flex-wrap items-center justify-end gap-2">
+                      <span className="mr-auto text-xs text-ink-soft">
+                        Drop this folder from the index? The files stay on your
+                        disk, they only stop showing up in search.
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmRoot(null)}
+                          className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                        >
+                          Keep folder
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeRoot(p)}
+                          disabled={removing === p}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-ochre/50 bg-ochre-soft px-2.5 py-1.5 text-xs font-medium text-ochre transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ochre"
+                        >
+                          {removing === p && (
+                            <span className="h-3.5 w-3.5 rounded-full border-2 border-ochre/30 border-t-ochre fo-spin" />
+                          )}
+                          {removing === p ? "Removing" : "Remove from index"}
+                        </button>
+                      </span>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmRoot(p);
+                        setNote("");
+                      }}
+                      className="shrink-0 rounded-md px-2.5 py-1.5 text-xs font-medium text-ochre transition-colors hover:bg-ochre-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ochre"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {note && (
+            <p className="border-t border-line bg-surface-2/50 px-4 py-2.5 text-xs text-ink-soft">
+              {note}
+            </p>
+          )}
         </div>
       )}
+
+      {progress && <ScanProgress progress={progress} label="Indexing folder" />}
+
+      {stopped && <StoppedNotice>{stopped}</StoppedNotice>}
 
       {error && (
         <div className="rounded-md border border-brick/40 bg-brick-soft px-3.5 py-2.5 text-sm text-brick">
@@ -253,7 +404,8 @@ function FilenameSearch({
       <div className="overflow-hidden rounded-lg border border-line bg-surface">
         <div className="flex items-center justify-between border-b border-line px-4 py-2.5 text-xs text-ink-soft">
           <span>
-            {hits.length.toLocaleString()} {hits.length === 1 ? "result" : "results"}
+            {hits.length.toLocaleString()}{" "}
+            {hits.length === 1 ? "result" : "results"}
           </span>
           <span className="font-mono">
             {formatSize(hits.reduce((s, h) => s + h.size, 0))} total
@@ -263,7 +415,9 @@ function FilenameSearch({
           {hits.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 px-6 py-16 text-center">
               <p className="text-sm font-medium text-ink">
-                {searched && (query || ext) ? "No files match" : "Nothing to show yet"}
+                {searched && (query || ext)
+                  ? "No files match"
+                  : "Nothing to show yet"}
               </p>
               <p className="max-w-xs text-sm text-ink-soft">
                 {searched && (query || ext)
@@ -275,7 +429,10 @@ function FilenameSearch({
             </div>
           ) : (
             <div
-              style={{ height: rowVirtualizer.getTotalSize(), position: "relative" }}
+              style={{
+                height: rowVirtualizer.getTotalSize(),
+                position: "relative",
+              }}
             >
               {rowVirtualizer.getVirtualItems().map((vi) => {
                 const h = hits[vi.index];
