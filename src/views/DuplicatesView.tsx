@@ -1,7 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatSize } from "../format";
 import { useDupMinMb, useScanMode } from "../store";
+import { SMALL_PX, isImage, useThumbs } from "../thumbs";
+import {
+  errorText,
+  exportResults,
+  isChanged,
+  isMissing,
+  loadSnapshot,
+} from "../snapshot";
+import type { DupPayload, LoadedSnapshot } from "../snapshot";
 import type {
   DupGroup,
   DupScanResult,
@@ -9,8 +18,17 @@ import type {
   Progress,
   ScanMode,
 } from "../types";
+import { ContentCoverageNote } from "../components/CoverageNote";
 import PageHeader from "../components/PageHeader";
 import Pager from "../components/Pager";
+import SnapshotBanner, {
+  ChangedTag,
+  ExportButton,
+  MissingTag,
+  OpenSavedButton,
+  SnapshotNote,
+} from "../components/SnapshotBanner";
+import { ThumbSlot } from "../components/Thumb";
 import RevealButton, {
   FileActionError,
   useFileActions,
@@ -38,9 +56,45 @@ const SUBTITLE: Record<DupMode, string> = {
     "Find files whose names say they belong together, like a copy sitting next to its original or one movie kept at two qualities. Names are all this compares, so you decide what goes.",
 };
 
+// Which mode can display each kind of saved file. Opening one switches the
+// page to it, so a snapshot always lands in the view that can read it.
+const MODE_FOR_KIND: Record<string, DupMode> = {
+  duplicates: "exact",
+  similar_images: "similar",
+  similar_names: "names",
+};
+
 export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
   const [mode, setMode] = useState<DupMode>("exact");
   const [scanMode, setScanMode] = useScanMode();
+  const [incoming, setIncoming] = useState<LoadedSnapshot | null>(null);
+  const [openBusy, setOpenBusy] = useState(false);
+  const [openError, setOpenError] = useState("");
+  const onAdopted = useCallback(() => setIncoming(null), []);
+
+  async function openSaved() {
+    setOpenBusy(true);
+    setOpenError("");
+    try {
+      const loaded = await loadSnapshot();
+      if (!loaded) return;
+      const next = MODE_FOR_KIND[loaded.snap.kind];
+      if (!next) {
+        setOpenError(
+          "That file holds search results. Open it from the Search page.",
+        );
+        return;
+      }
+      setMode(next);
+      setIncoming(loaded);
+    } catch (e) {
+      setOpenError(errorText(e));
+    } finally {
+      setOpenBusy(false);
+    }
+  }
+
+  const shared = { incoming, onAdopted, onOpenSaved: openSaved, openBusy };
   return (
     <div className="space-y-6">
       <PageHeader
@@ -63,21 +117,32 @@ export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
           />
         }
       />
+      {openError && (
+        <div className="rounded-md border border-brick/40 bg-brick-soft px-3.5 py-2.5 text-sm text-brick">
+          {openError}
+        </div>
+      )}
       {mode === "exact" && (
         <ExactDuplicates
           algo={algo}
           scanMode={scanMode}
           onScanMode={setScanMode}
+          {...shared}
         />
       )}
       {mode === "similar" && (
-        <SimilarImagesView scanMode={scanMode} onScanMode={setScanMode} />
+        <SimilarImagesView
+          scanMode={scanMode}
+          onScanMode={setScanMode}
+          {...shared}
+        />
       )}
       {mode === "names" && (
         <SimilarNamesView
           scanMode={scanMode}
           onScanMode={setScanMode}
           onExact={() => setMode("exact")}
+          {...shared}
         />
       )}
     </div>
@@ -94,12 +159,19 @@ function shortestPath(paths: string[]): string {
   )[0];
 }
 
-// Selected == the copies to remove. Default keeps the shortest path and
-// preselects every other copy for the trash.
-function defaultRemoval(g: DupGroup): Set<string> {
-  const keep = shortestPath(g.paths);
-  return new Set(g.paths.filter((p) => p !== keep));
+// Selected == the copies to remove. Default keeps the shortest path still on
+// disk and preselects every other copy for the trash. A file a snapshot says is
+// gone is never preselected: it is not a copy anyone can reclaim space from.
+function defaultRemoval(
+  g: DupGroup,
+  gone: (path: string) => boolean,
+): Set<string> {
+  const live = g.paths.filter((p) => !gone(p));
+  const keep = shortestPath(live.length > 0 ? live : g.paths);
+  return new Set(live.filter((p) => p !== keep));
 }
+
+type Coverage = { roots: string[]; unreadable: number };
 
 // What the scan reads: the whole index across every drive, or one picked folder.
 type DupScope = "indexed" | "folder";
@@ -140,10 +212,18 @@ function ExactDuplicates({
   algo,
   scanMode,
   onScanMode,
+  incoming,
+  onAdopted,
+  onOpenSaved,
+  openBusy,
 }: {
   algo: HashAlgo;
   scanMode: ScanMode;
   onScanMode: (m: ScanMode) => void;
+  incoming: LoadedSnapshot | null;
+  onAdopted: () => void;
+  onOpenSaved: () => void;
+  openBusy: boolean;
 }) {
   const [scope, setScope] = useState<DupScope>("indexed");
   // null until the index answers, so the picker never flashes an empty state
@@ -168,9 +248,16 @@ function ExactDuplicates({
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
+  const [coverage, setCoverage] = useState<Coverage | null>(null);
+  const [snapshot, setSnapshot] = useState<LoadedSnapshot | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saved, setSaved] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
   const files = useFileActions();
+  const gone = (path: string) =>
+    snapshot != null && isMissing(snapshot.checked, path);
 
   // Turning the page puts the reader at the top of the new one, not halfway
   // down where the last one ended.
@@ -203,6 +290,33 @@ function ExactDuplicates({
       .catch(() => setRoots([]));
   }, []);
 
+  // A snapshot the page handed down. Adopting it replaces whatever is on screen
+  // and rebuilds the selection, because those picks were made against a scan
+  // that was live at the time.
+  useEffect(() => {
+    if (!incoming || incoming.snap.kind !== "duplicates") return;
+    const payload = incoming.snap.payload as DupPayload;
+    const next = payload.groups ?? [];
+    setSnapshot(incoming);
+    setGroups(next);
+    setGroupCount(payload.group_count ?? next.length);
+    setCoverage({
+      roots: payload.unavailable_roots ?? [],
+      unreadable: payload.unreadable_files ?? 0,
+    });
+    setStopped(payload.cancelled ?? false);
+    setScanned(null);
+    setPage(0);
+    setError("");
+    setDone("");
+    setSaved("");
+    const sel: Record<string, Set<string>> = {};
+    for (const g of next)
+      sel[g.hash] = defaultRemoval(g, (p) => isMissing(incoming.checked, p));
+    setSelection(sel);
+    onAdopted();
+  }, [incoming, onAdopted]);
+
   function chooseScope(next: DupScope) {
     chosen.current = true;
     setScope(next);
@@ -221,10 +335,14 @@ function ExactDuplicates({
     }
     setError("");
     setDone("");
+    setSaved("");
+    setSaveError("");
     setStopped(false);
     setScanning(true);
     setProgress({ done: 0, total: 0 });
     setGroups(null);
+    setSnapshot(null);
+    setCoverage(null);
     setPage(0);
     try {
       const res =
@@ -242,19 +360,53 @@ function ExactDuplicates({
       setScanned(scope);
       setGroups(res.groups);
       setGroupCount(res.group_count);
+      setCoverage({
+        roots: res.unavailable_roots ?? [],
+        unreadable: res.unreadable_files ?? 0,
+      });
       setStopped(res.cancelled);
       const sel: Record<string, Set<string>> = {};
-      for (const g of res.groups) sel[g.hash] = defaultRemoval(g);
+      for (const g of res.groups) sel[g.hash] = defaultRemoval(g, () => false);
       setSelection(sel);
     } catch (e) {
-      setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Scan failed: ${errorText(e)}`);
     } finally {
       setScanning(false);
       setProgress(null);
     }
   }
 
+  async function save() {
+    if (!groups) return;
+    setSaving(true);
+    setSaveError("");
+    setSaved("");
+    try {
+      const path = await exportResults(
+        "duplicates",
+        scanned === "folder" ? root : null,
+        algo === "blake3" ? "BLAKE3" : "SHA-256",
+        {
+          group_count: groupCount,
+          groups,
+          cancelled: stopped,
+          unavailable_roots: coverage?.roots ?? [],
+          unreadable_files: coverage?.unreadable ?? 0,
+        } satisfies DupPayload,
+      );
+      if (path)
+        setSaved(
+          `Saved ${groups.length.toLocaleString()} sets to ${path}. Open it again from any duplicate mode.`,
+        );
+    } catch (e) {
+      setSaveError(`Nothing was saved: ${errorText(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function toggle(hash: string, path: string) {
+    if (gone(path)) return;
     setSelection((prev) => {
       const next = new Set(prev[hash] ?? []);
       if (next.has(path)) next.delete(path);
@@ -277,14 +429,15 @@ function ExactDuplicates({
     for (const g of groups ?? []) {
       const sel = selection[g.hash];
       const rm = sel?.size ?? 0;
-      if (rm >= g.paths.length) invalid++;
+      const live = g.paths.filter((p) => !gone(p)).length;
+      if (rm > 0 && rm >= live) invalid++;
       if (rm > 0) sets++;
       count += rm;
       bytes += rm * g.size;
       for (const p of sel ?? []) if (!filter.shows(p)) hidden++;
     }
     return { count, bytes, invalid, sets, hidden };
-  }, [groups, selection, filter.shows]);
+  }, [groups, selection, filter.shows, snapshot]);
 
   const wasted = useMemo(
     () => (groups ?? []).reduce((s, g) => s + g.size * (g.paths.length - 1), 0),
@@ -299,6 +452,12 @@ function ExactDuplicates({
   const shown = filter.filtered
     ? filter.filtered.slice(from, from + PER_PAGE)
     : [];
+  // Only the sets on this page. Nothing off screen is ever requested, and what
+  // has already arrived is served from the module cache when paging back.
+  const thumb = useThumbs(
+    shown.flatMap((g) => g.paths),
+    SMALL_PX,
+  );
 
   async function trashSelected() {
     const paths: string[] = [];
@@ -317,16 +476,14 @@ function ExactDuplicates({
         Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
       );
       const sel: Record<string, Set<string>> = {};
-      for (const g of remaining) sel[g.hash] = defaultRemoval(g);
+      for (const g of remaining) sel[g.hash] = defaultRemoval(g, gone);
       setSelection(sel);
       setConfirming(false);
       setDone(
         `Moved ${paths.length} ${paths.length === 1 ? "file" : "files"} to Trash and reclaimed ${formatSize(summary.bytes)}. Restore anytime from Trash.`,
       );
     } catch (e) {
-      setError(
-        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      setError(`Could not move files: ${errorText(e)}`);
       setConfirming(false);
     }
   }
@@ -344,6 +501,10 @@ function ExactDuplicates({
           ]}
         />
         <div className="flex flex-wrap items-center gap-2">
+          {groups && groups.length > 0 && !snapshot && (
+            <ExportButton onExport={save} busy={saving} kind="duplicates" />
+          )}
+          <OpenSavedButton onOpen={onOpenSaved} busy={openBusy} />
           {scope === "folder" && (
             <button
               type="button"
@@ -371,7 +532,23 @@ function ExactDuplicates({
         </div>
       </div>
 
-      {scope === "folder" && root && (
+      <SnapshotNote error={saveError} done={saved} />
+
+      {snapshot && groups && (
+        <SnapshotBanner
+          loaded={snapshot}
+          summary={`${groupCount.toLocaleString()} ${groupCount === 1 ? "set" : "sets"}`}
+          onClose={() => {
+            setSnapshot(null);
+            setGroups(null);
+            setSelection({});
+            setCoverage(null);
+            setStopped(false);
+          }}
+        />
+      )}
+
+      {scope === "folder" && root && !snapshot && (
         <p className="truncate font-mono text-xs text-ink-soft">
           <span className="text-ink-faint">Target </span>
           {root}
@@ -477,6 +654,14 @@ function ExactDuplicates({
         </StoppedNotice>
       )}
 
+      {coverage && !snapshot && (
+        <ContentCoverageNote
+          roots={coverage.roots}
+          unreadable={coverage.unreadable}
+          noun="duplicate set"
+        />
+      )}
+
       {error && (
         <div className="rounded-md border border-brick/40 bg-brick-soft px-3.5 py-2.5 text-sm text-brick">
           {error}
@@ -556,8 +741,13 @@ function ExactDuplicates({
           <div ref={listRef} className="space-y-4">
             {shown.map((g) => {
               const sel = selection[g.hash] ?? new Set<string>();
-              const keeping = g.paths.length - sel.size;
+              const missing = g.paths.filter(gone).length;
+              const keeping = g.paths.length - sel.size - missing;
               const drives = new Set(g.paths.map(driveOf)).size;
+              // Every copy in a set is the same file, so one image copy means
+              // the whole set gets the preview column and the rows stay lined
+              // up whether or not a given preview ever arrives.
+              const previews = g.paths.some(isImage);
               return (
                 <div
                   key={g.hash}
@@ -575,6 +765,11 @@ function ExactDuplicates({
                           {drives > 1 && (
                             <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
                               across {drives} drives
+                            </span>
+                          )}
+                          {missing > 0 && (
+                            <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
+                              {missing} missing
                             </span>
                           )}
                         </div>
@@ -602,6 +797,7 @@ function ExactDuplicates({
                   <ul>
                     {g.paths.map((p) => {
                       const remove = sel.has(p);
+                      const lost = gone(p);
                       const cut = Math.max(
                         p.lastIndexOf("/"),
                         p.lastIndexOf("\\"),
@@ -612,28 +808,62 @@ function ExactDuplicates({
                         <li key={p}>
                           <div
                             onDoubleClick={() => files.open(p)}
-                            className="flex items-center gap-2 border-b border-line/60 px-4 py-2.5 last:border-b-0 hover:bg-surface-2/50"
+                            className={
+                              "flex items-center gap-2 border-b border-line/60 px-4 py-2.5 last:border-b-0 " +
+                              (lost
+                                ? "bg-surface-2/40"
+                                : "hover:bg-surface-2/50")
+                            }
                           >
-                            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+                            <label
+                              className={
+                                "flex min-w-0 flex-1 items-center gap-3 " +
+                                (lost ? "cursor-default" : "cursor-pointer")
+                              }
+                            >
                               <span
                                 className={
                                   "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
-                                  (remove
-                                    ? "border-brick bg-brick text-white"
-                                    : "border-line-strong bg-surface")
+                                  (lost
+                                    ? "border-line bg-surface-2"
+                                    : remove
+                                      ? "border-brick bg-brick text-white"
+                                      : "border-line-strong bg-surface")
                                 }
                               >
                                 <input
                                   type="checkbox"
                                   checked={remove}
+                                  disabled={lost}
                                   onChange={() => toggle(g.hash, p)}
-                                  aria-label={`Remove ${name}`}
+                                  aria-label={
+                                    lost
+                                      ? `${name} is missing`
+                                      : `Remove ${name}`
+                                  }
                                   className="sr-only"
                                 />
-                                {remove && <IconCheck className="h-3 w-3" />}
+                                {remove && !lost && (
+                                  <IconCheck className="h-3 w-3" />
+                                )}
                               </span>
+                              {previews && (
+                                <ThumbSlot
+                                  path={p}
+                                  src={thumb(p)}
+                                  size="h-10 w-10"
+                                  dim={lost}
+                                />
+                              )}
                               <span className="min-w-0 flex-1">
-                                <span className="block truncate text-sm text-ink">
+                                <span
+                                  className={
+                                    "block truncate text-sm " +
+                                    (lost
+                                      ? "text-ink-faint line-through"
+                                      : "text-ink")
+                                  }
+                                >
                                   {name}
                                 </span>
                                 <span className="block truncate font-mono text-xs text-ink-faint">
@@ -641,14 +871,20 @@ function ExactDuplicates({
                                 </span>
                               </span>
                             </label>
-                            <span
-                              className={
-                                "shrink-0 text-xs " +
-                                (remove ? "text-brick" : "text-teal")
-                              }
-                            >
-                              {remove ? "Remove" : "Keep"}
-                            </span>
+                            {lost ? (
+                              <MissingTag />
+                            ) : snapshot && isChanged(snapshot.checked, p) ? (
+                              <ChangedTag />
+                            ) : (
+                              <span
+                                className={
+                                  "shrink-0 text-xs " +
+                                  (remove ? "text-brick" : "text-teal")
+                                }
+                              >
+                                {remove ? "Remove" : "Keep"}
+                              </span>
+                            )}
                             <RevealButton
                               name={name}
                               onReveal={() => files.reveal(p)}

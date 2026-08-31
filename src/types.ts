@@ -63,18 +63,40 @@ export type ScanMode = "auto" | "sequential";
 // whatever it managed to finish plus whether the user stopped it.
 // group_count is the true number of sets the scan confirmed, which can exceed
 // the groups it hands back when the backend caps the payload.
+// unavailable_roots and unreadable_files are the honesty fields. A content scan
+// cannot open a file on a drive that is not plugged in, so a short result has to
+// say so instead of reading as a complete one.
 export type DupScanResult = {
   group_count: number;
   groups: DupGroup[];
   cancelled: boolean;
+  unavailable_roots: string[];
+  unreadable_files: number;
 };
-export type SimilarScanResult = { groups: SimilarGroup[]; cancelled: boolean };
+export type SimilarScanResult = {
+  groups: SimilarGroup[];
+  cancelled: boolean;
+  unavailable_roots: string[];
+  unreadable_files: number;
+};
+// Names come from the index and no file is opened, so a disconnected drive is
+// still covered here. No unreadable_files for the same reason.
 export type NameScanResult = {
   group_count: number;
   groups: NameGroup[];
   cancelled: boolean;
+  unavailable_roots: string[];
 };
 export type IndexResult = { count: number; cancelled: boolean };
+
+// An indexed folder and whether it can be reached right now. Rows from an
+// unplugged drive stay searchable, so available is how the UI says a hit cannot
+// be opened and why a content scan came back short.
+export type RootStatus = {
+  path: string;
+  available: boolean;
+  file_count: number;
+};
 
 export type ContentHit = {
   path: string;
@@ -95,11 +117,48 @@ export type StorageStats = {
 };
 
 // Everything the app keeps on this device. trashed_files counts the files still
-// sitting in the app's own Trash, which is what blocks a reset.
+// sitting in the app's own Trash, which is what blocks a reset. Thumbnails are
+// reported apart because they live in the OS cache folder, outside dir.
 export type AppDataSummary = {
   dir: string;
   bytes: number;
   trashed_files: number;
+  thumbs_dir: string;
+  thumbs_bytes: number;
+};
+
+// One preview from get_thumbnails. data_uri is ready to drop into an img src.
+// A file that is not a raster image comes back with neither a preview nor an
+// error, and the row simply shows nothing.
+export type Thumb = {
+  path: string;
+  data_uri: string | null;
+  error: string | null;
+};
+
+// A result set parked on a file. payload is opaque here and read per kind, the
+// same way the runtime treats it.
+export type SnapshotKind =
+  "duplicates" | "similar_images" | "similar_names" | "search";
+
+export type ResultSnapshot = {
+  format: string;
+  version: number;
+  kind: string;
+  created_ns: number;
+  app_version: string;
+  scope: string | null;
+  note: string | null;
+  payload: unknown;
+};
+
+// One snapshot path checked against the disk as it is now. size_changed is null
+// when the file is gone or the snapshot carried no size to compare against.
+export type PathStatus = {
+  path: string;
+  exists: boolean;
+  size: number | null;
+  size_changed: boolean | null;
 };
 
 export type TrashItem = {

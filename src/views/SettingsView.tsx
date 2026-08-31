@@ -5,6 +5,7 @@ import PageHeader from "../components/PageHeader";
 import Segmented from "../components/Segmented";
 import { IconCheck, IconKey, IconReveal } from "../components/icons";
 import { formatSize } from "../format";
+import { forgetThumbs } from "../thumbs";
 import type {
   AppDataSummary,
   HashAlgo,
@@ -224,6 +225,8 @@ function StoredDataControl({ onReset }: { onReset: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
+  const [clearing, setClearing] = useState(false);
+  const [thumbNote, setThumbNote] = useState("");
 
   async function load() {
     try {
@@ -254,6 +257,28 @@ function StoredDataControl({ onReset }: { onReset: () => void }) {
       setError(
         `Could not open the folder: ${e instanceof Error ? e.message : String(e)}`,
       );
+    }
+  }
+
+  // Safe at any moment: the next result list simply regenerates the previews it
+  // needs. The app's own copy goes too, so the UI stops showing thumbnails it
+  // no longer has on disk.
+  async function clearThumbs() {
+    setClearing(true);
+    setThumbNote("");
+    try {
+      const freed = await invoke<number>("clear_thumbnail_cache");
+      forgetThumbs();
+      setThumbNote(
+        `Cleared ${formatSize(freed)}. Previews come back as you browse results.`,
+      );
+      await load();
+    } catch (e) {
+      setThumbNote(
+        `Nothing was cleared: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      setClearing(false);
     }
   }
 
@@ -301,6 +326,35 @@ function StoredDataControl({ onReset }: { onReset: () => void }) {
           </button>
         </div>
       </div>
+      {/* Its own card because it is its own folder, and because clearing it is
+          harmless in a way that deleting the data folder is not. */}
+      <div className="mt-2.5 rounded-md border border-line bg-surface-2 px-3 py-2.5">
+        <div
+          className="truncate font-mono text-xs text-ink"
+          title={summary?.thumbs_dir ?? undefined}
+        >
+          {summary ? shortPath(summary.thumbs_dir) : "Reading folder"}
+        </div>
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <span className="font-mono text-xs tabular-nums text-ink-soft">
+            {summary
+              ? `${formatSize(summary.thumbs_bytes)} in thumbnails`
+              : "Checking size"}
+          </span>
+          <button
+            type="button"
+            onClick={clearThumbs}
+            disabled={!summary || clearing}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-line bg-surface px-2.5 py-1 text-xs font-medium text-ink hover:border-line-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+          >
+            {clearing && (
+              <span className="h-3.5 w-3.5 rounded-full border-2 border-line-strong border-t-ink-soft fo-spin" />
+            )}
+            {clearing ? "Clearing" : "Clear cache"}
+          </button>
+        </div>
+      </div>
+      {thumbNote && <p className="mt-2 text-xs text-ink-soft">{thumbNote}</p>}
       {blocked && (
         <p className="mt-2.5 border-l-2 border-ochre pl-2.5 text-sm text-ochre">
           {blockedReason} Deleting now would take them with it.
@@ -478,7 +532,7 @@ export default function SettingsView({
         <Row
           top
           title="Stored data"
-          desc="The app keeps its index, chat history, rules and settings in a folder on this device. Deleting it leaves your own files alone."
+          desc="The app keeps its index, chat history, rules and settings in a folder on this device. Thumbnails sit in a separate cache you can clear on its own. Deleting either leaves your own files alone."
         >
           <StoredDataControl onReset={() => setReload((n) => n + 1)} />
         </Row>

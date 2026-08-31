@@ -1,12 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatDate, formatSize } from "../format";
-import type { IndexResult, Progress, SearchHit } from "../types";
+import { SMALL_PX, isImage, useThumbs } from "../thumbs";
+import {
+  errorText,
+  exportResults,
+  isChanged,
+  isMissing,
+  loadSnapshot,
+} from "../snapshot";
+import type { LoadedSnapshot, SearchPayload } from "../snapshot";
+import type { IndexResult, Progress, RootStatus, SearchHit } from "../types";
 import PageHeader from "../components/PageHeader";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
+import SnapshotBanner, {
+  ChangedTag,
+  ExportButton,
+  MissingTag,
+  OpenSavedButton,
+  SnapshotNote,
+} from "../components/SnapshotBanner";
 import StoppedNotice from "../components/StoppedNotice";
+import { ThumbSlot } from "../components/Thumb";
 import RevealButton from "../components/FileActions";
 import ContentSearchView from "./ContentSearchView";
 import {
@@ -80,12 +97,18 @@ function FilenameSearch({
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState("");
   const [stopped, setStopped] = useState("");
-  const [roots, setRoots] = useState<string[]>([]);
+  const [roots, setRoots] = useState<RootStatus[]>([]);
   const [showRoots, setShowRoots] = useState(false);
   const [confirmRoot, setConfirmRoot] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [loaded, setLoaded] = useState<LoadedSnapshot | null>(null);
+  const [snapHits, setSnapHits] = useState<SearchHit[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [openBusy, setOpenBusy] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saved, setSaved] = useState("");
   const parentRef = useRef<HTMLDivElement>(null);
 
   const stateRef = useRef({ query, ext, minIdx });
@@ -159,9 +182,11 @@ function FilenameSearch({
     }
   }
 
+  // Status, not just paths: a root on an unplugged drive keeps every one of its
+  // rows searchable, so the list has to say so rather than showing it as fine.
   const refreshRoots = useCallback(async () => {
     try {
-      setRoots(await invoke<string[]>("list_indexed_roots"));
+      setRoots(await invoke<RootStatus[]>("indexed_roots_status"));
     } catch {
       // keep the last known list rather than blanking the panel
     }
@@ -192,17 +217,72 @@ function FilenameSearch({
     }
   }
 
+  // What the list is actually showing: a live search, or a saved list that is
+  // deliberately not being re-run underneath the reader.
+  const rows = loaded ? snapHits : hits;
+  const gone = (path: string) =>
+    loaded != null && isMissing(loaded.checked, path);
+
   // Drop any selected path that fell out of the current results.
   useEffect(() => {
     setSelected((prev) => {
       if (prev.size === 0) return prev;
-      const live = new Set(hits.map((h) => h.path));
+      const live = new Set(rows.map((h) => h.path));
       const next = new Set([...prev].filter((p) => live.has(p)));
       return next.size === prev.size ? prev : next;
     });
-  }, [hits]);
+  }, [rows]);
+
+  async function save() {
+    setSaving(true);
+    setSaveError("");
+    setSaved("");
+    try {
+      const path = await exportResults(
+        "search",
+        null,
+        query ? `the query "${query}"` : null,
+        {
+          query,
+          ext,
+          min_size: SIZE_PRESETS[minIdx].bytes,
+          hits,
+        } satisfies SearchPayload,
+      );
+      if (path)
+        setSaved(`Saved ${hits.length.toLocaleString()} results to ${path}`);
+    } catch (e) {
+      setSaveError(`Nothing was saved: ${errorText(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function openSaved() {
+    setOpenBusy(true);
+    setSaveError("");
+    setSaved("");
+    try {
+      const next = await loadSnapshot();
+      if (!next) return;
+      if (next.snap.kind !== "search") {
+        setSaveError(
+          "That file holds duplicate results. Open it from the Duplicates page.",
+        );
+        return;
+      }
+      setLoaded(next);
+      setSnapHits((next.snap.payload as SearchPayload).hits ?? []);
+      setSelected(new Set());
+    } catch (e) {
+      setSaveError(errorText(e));
+    } finally {
+      setOpenBusy(false);
+    }
+  }
 
   function toggle(path: string) {
+    if (gone(path)) return;
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
@@ -237,20 +317,34 @@ function FilenameSearch({
     try {
       await invoke<string>("trash_files", { paths, reason: "manual" });
       setSelected(new Set());
-      await runSearch();
+      // A saved list is not re-run, so the rows that just went are taken out of
+      // it by hand rather than by searching again.
+      if (loaded) {
+        const removed = new Set(paths);
+        setSnapHits((prev) => prev.filter((h) => !removed.has(h.path)));
+      } else await runSearch();
     } catch (e) {
-      setError(
-        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      setError(`Could not move files: ${errorText(e)}`);
     }
   }
 
   const rowVirtualizer = useVirtualizer({
-    count: hits.length,
+    count: rows.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 58,
     overscan: 14,
   });
+  const virtual = rowVirtualizer.getVirtualItems();
+  // Only the window the virtualizer is actually drawing, so scrolling a result
+  // set of thousands never asks the drive for more than a screenful at a time.
+  const thumb = useThumbs(
+    virtual.map((vi) => rows[vi.index]?.path ?? ""),
+    SMALL_PX,
+  );
+  // One image anywhere in the results reserves the column on every row, so a
+  // mixed list stays in one straight edge instead of stepping in and out.
+  const previews = useMemo(() => rows.some((h) => isImage(h.path)), [rows]);
+  const offline = roots.filter((r) => !r.available).length;
 
   return (
     <div className={"space-y-6" + (selected.size > 0 ? " pb-24" : "")}>
@@ -272,21 +366,35 @@ function FilenameSearch({
             }
           />
           Indexed folders ({roots.length})
-        </button>
-        <button
-          type="button"
-          onClick={addFolder}
-          disabled={busy}
-          className="inline-flex items-center gap-2 rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
-        >
-          {busy ? (
-            <span className="h-4 w-4 rounded-full border-2 border-white/40 border-t-white fo-spin" />
-          ) : (
-            <IconFolder className="h-4 w-4" />
+          {offline > 0 && (
+            <span className="text-ochre">
+              {" · "}
+              {offline} not connected
+            </span>
           )}
-          {busy ? "Indexing" : "Add folder"}
         </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {hits.length > 0 && !loaded && (
+            <ExportButton onExport={save} busy={saving} kind="search" />
+          )}
+          <OpenSavedButton onOpen={openSaved} busy={openBusy} />
+          <button
+            type="button"
+            onClick={addFolder}
+            disabled={busy}
+            className="inline-flex items-center gap-2 rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
+          >
+            {busy ? (
+              <span className="h-4 w-4 rounded-full border-2 border-white/40 border-t-white fo-spin" />
+            ) : (
+              <IconFolder className="h-4 w-4" />
+            )}
+            {busy ? "Indexing" : "Add folder"}
+          </button>
+        </div>
       </div>
+
+      <SnapshotNote error={saveError} done={saved} />
 
       {showRoots && (
         <div className="overflow-hidden rounded-lg border border-line bg-surface">
@@ -301,13 +409,29 @@ function FilenameSearch({
             </div>
           ) : (
             <ul>
-              {roots.map((p) => (
+              {roots.map(({ path: p, available, file_count }) => (
                 <li
                   key={p}
                   className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-line/70 px-4 py-2.5 last:border-b-0"
                 >
-                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-soft">
-                    {p}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-mono text-xs text-ink-soft">
+                      {p}
+                    </span>
+                    <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink-faint">
+                      {!available && (
+                        <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 font-medium text-ochre">
+                          Not connected
+                        </span>
+                      )}
+                      <span>
+                        <span className="font-mono tabular-nums">
+                          {file_count.toLocaleString()}
+                        </span>{" "}
+                        {file_count === 1 ? "file" : "files"} indexed
+                        {available ? "" : ", still searchable but not openable"}
+                      </span>
+                    </span>
                   </span>
                   {confirmRoot === p ? (
                     <div className="flex w-full flex-wrap items-center justify-end gap-2">
@@ -370,49 +494,64 @@ function FilenameSearch({
         </div>
       )}
 
-      <div className="flex flex-col gap-3 sm:flex-row">
-        <div className="relative flex-1">
-          <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-ink-faint" />
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by name or path"
-            className="w-full rounded-md border border-line bg-surface py-2.5 pl-10 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30"
-          />
-        </div>
-        <input
-          value={ext}
-          onChange={(e) => setExt(e.target.value)}
-          placeholder="Extension"
-          aria-label="Filter by extension"
-          className="w-full rounded-md border border-line bg-surface px-3 py-2.5 font-mono text-sm text-ink outline-none placeholder:font-sans placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 sm:w-36"
+      {/* A saved list is not something you can type into, so the banner takes
+          the place of the query controls until it is closed. */}
+      {loaded ? (
+        <SnapshotBanner
+          loaded={loaded}
+          summary={`${snapHits.length.toLocaleString()} ${snapHits.length === 1 ? "result" : "results"}`}
+          onClose={() => {
+            setLoaded(null);
+            setSnapHits([]);
+            setSelected(new Set());
+          }}
         />
-        <select
-          value={minIdx}
-          onChange={(e) => setMinIdx(Number(e.target.value))}
-          aria-label="Minimum size"
-          className="w-full rounded-md border border-line bg-surface px-3 py-2.5 text-sm text-ink outline-none focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 sm:w-40"
-        >
-          {SIZE_PRESETS.map((p, i) => (
-            <option key={p.label} value={i}>
-              {p.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      ) : (
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <div className="relative flex-1">
+            <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-ink-faint" />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search by name or path"
+              className="w-full rounded-md border border-line bg-surface py-2.5 pl-10 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30"
+            />
+          </div>
+          <input
+            value={ext}
+            onChange={(e) => setExt(e.target.value)}
+            placeholder="Extension"
+            aria-label="Filter by extension"
+            className="w-full rounded-md border border-line bg-surface px-3 py-2.5 font-mono text-sm text-ink outline-none placeholder:font-sans placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 sm:w-36"
+          />
+          <select
+            value={minIdx}
+            onChange={(e) => setMinIdx(Number(e.target.value))}
+            aria-label="Minimum size"
+            className="w-full rounded-md border border-line bg-surface px-3 py-2.5 text-sm text-ink outline-none focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 sm:w-40"
+          >
+            {SIZE_PRESETS.map((p, i) => (
+              <option key={p.label} value={i}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       <div className="overflow-hidden rounded-lg border border-line bg-surface">
         <div className="flex items-center justify-between border-b border-line px-4 py-2.5 text-xs text-ink-soft">
           <span>
-            {hits.length.toLocaleString()}{" "}
-            {hits.length === 1 ? "result" : "results"}
+            {rows.length.toLocaleString()}{" "}
+            {rows.length === 1 ? "result" : "results"}
+            {loaded && <span className="text-ink-faint"> as saved</span>}
           </span>
           <span className="font-mono">
-            {formatSize(hits.reduce((s, h) => s + h.size, 0))} total
+            {formatSize(rows.reduce((s, h) => s + h.size, 0))} total
           </span>
         </div>
         <div ref={parentRef} className="h-[52vh] min-h-[280px] overflow-auto">
-          {hits.length === 0 ? (
+          {rows.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 px-6 py-16 text-center">
               <p className="text-sm font-medium text-ink">
                 {searched && (query || ext)
@@ -434,49 +573,83 @@ function FilenameSearch({
                 position: "relative",
               }}
             >
-              {rowVirtualizer.getVirtualItems().map((vi) => {
-                const h = hits[vi.index];
+              {virtual.map((vi) => {
+                const h = rows[vi.index];
                 const isSel = selected.has(h.path);
+                const lost = gone(h.path);
                 return (
                   <div
                     key={vi.key}
                     onDoubleClick={() => open(h.path)}
                     className={
                       "group absolute left-0 top-0 flex w-full items-center gap-3 border-b border-line/70 px-4 " +
-                      (isSel ? "bg-teal-soft/60" : "hover:bg-surface-2/40")
+                      (lost
+                        ? "bg-surface-2/40"
+                        : isSel
+                          ? "bg-teal-soft/60"
+                          : "hover:bg-surface-2/40")
                     }
                     style={{
                       height: vi.size,
                       transform: `translateY(${vi.start}px)`,
                     }}
                   >
-                    <label className="flex shrink-0 cursor-pointer items-center">
+                    <label
+                      className={
+                        "flex shrink-0 items-center " +
+                        (lost ? "cursor-default" : "cursor-pointer")
+                      }
+                    >
                       <span
                         className={
                           "grid h-4 w-4 place-items-center rounded-[3px] border transition-colors " +
-                          (isSel
-                            ? "border-teal bg-teal text-white"
-                            : "border-line-strong bg-surface")
+                          (lost
+                            ? "border-line bg-surface-2"
+                            : isSel
+                              ? "border-teal bg-teal text-white"
+                              : "border-line-strong bg-surface")
                         }
                       >
                         <input
                           type="checkbox"
                           checked={isSel}
+                          disabled={lost}
                           onChange={() => toggle(h.path)}
-                          aria-label={`Select ${h.name}`}
+                          aria-label={
+                            lost ? `${h.name} is missing` : `Select ${h.name}`
+                          }
                           className="sr-only"
                         />
-                        {isSel && <IconCheck className="h-3 w-3" />}
+                        {isSel && !lost && <IconCheck className="h-3 w-3" />}
                       </span>
                     </label>
+                    {previews && (
+                      <ThumbSlot
+                        path={h.path}
+                        src={thumb(h.path)}
+                        size="h-10 w-10"
+                        dim={lost}
+                      />
+                    )}
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium text-ink">
+                      <div
+                        className={
+                          "truncate text-sm font-medium " +
+                          (lost ? "text-ink-faint line-through" : "text-ink")
+                        }
+                      >
                         {h.name}
                       </div>
                       <div className="truncate font-mono text-xs text-ink-faint">
                         {h.path}
                       </div>
                     </div>
+                    {lost ? (
+                      <MissingTag />
+                    ) : (
+                      loaded &&
+                      isChanged(loaded.checked, h.path) && <ChangedTag />
+                    )}
                     <RevealButton
                       name={h.name}
                       onReveal={() => reveal(h.path)}

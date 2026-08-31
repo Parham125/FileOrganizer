@@ -14,10 +14,13 @@ import type {
   NameGroup,
   NameScanResult,
   NameStrategy,
+  PathStatus,
   PendingAction,
   Progress,
   QuestionAnswer,
   ReasoningEffort,
+  ResultSnapshot,
+  RootStatus,
   Rule,
   RuleFilter,
   RuleRun,
@@ -26,6 +29,7 @@ import type {
   SimilarGroup,
   SimilarScanResult,
   StorageStats,
+  Thumb,
   TrashItem,
 } from "./types";
 
@@ -43,7 +47,13 @@ export type Bridge = {
   invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   listen: <T>(event: string, handler: Handler<T>) => Promise<UnlistenFn>;
   pickFolder: () => Promise<string | null>;
+  pickSaveFile: (defaultPath: string) => Promise<string | null>;
+  pickOpenFile: () => Promise<string | null>;
 };
+
+const RESULTS_FILTER = [
+  { name: "FileOrganizer results", extensions: ["json"] },
+];
 
 async function realBridge(): Promise<Bridge> {
   const core = await import("@tauri-apps/api/core");
@@ -56,6 +66,16 @@ async function realBridge(): Promise<Bridge> {
     pickFolder: async () => {
       const dir = await dialog.open({ directory: true, multiple: false });
       return typeof dir === "string" ? dir : null;
+    },
+    pickSaveFile: async (defaultPath) =>
+      await dialog.save({ defaultPath, filters: RESULTS_FILTER }),
+    pickOpenFile: async () => {
+      const file = await dialog.open({
+        directory: false,
+        multiple: false,
+        filters: RESULTS_FILTER,
+      });
+      return typeof file === "string" ? file : null;
     },
   };
 }
@@ -360,7 +380,219 @@ function makeSimilarGroups(): SimilarGroup[] {
         f("/Users/you/Desktop/sunset-final copy.jpg", 5_090_000, 12),
       ],
     },
+    {
+      distance: 6,
+      files: [
+        f("/Users/you/Pictures/2026/harbour-burst-01.jpg", 7_400_000, 31),
+        f("/Users/you/Pictures/2026/harbour-burst-02.jpg", 7_390_000, 31),
+        f("/Users/you/Pictures/2026/harbour-burst-03.jpg", 7_420_000, 31),
+        f("/Users/you/Pictures/exports/harbour-burst-edit.jpg", 4_100_000, 8),
+      ],
+    },
   ];
+}
+
+// ---- Stand-in previews ----------------------------------------------------
+// Real JPEG data URIs drawn on a canvas, so the browser preview shows actual
+// pictures. The drawing is keyed off the name with its copy markers and frame
+// numbers stripped, which is what makes a look-alike set come back looking
+// alike, the same way the desktop build would.
+
+const drawn = new Map<string, string>();
+
+function hashOf(text: string): number {
+  let h = 2_166_136_261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16_777_619);
+  }
+  return Math.abs(h);
+}
+
+function mockThumb(path: string, px: number): string {
+  const key = `${path}|${px}`;
+  const had = drawn.get(key);
+  if (had) return had;
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  let stem = name.replace(/\.[a-z0-9]+$/, "");
+  // Strip trailing markers until nothing is left to strip, so "sunset-final"
+  // and "sunset-final copy" collapse to the same picture.
+  for (let i = 0; i < 4; i++)
+    stem = stem.replace(/[\s_-]*(copy|final|edit|master|\d+)$/, "");
+  const set = hashOf(stem);
+  const own = hashOf(path);
+  const portrait = set % 5 === 0;
+  const w = portrait ? Math.round(px * 0.75) : px;
+  const h = portrait ? px : Math.round(px * 0.72);
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const g = canvas.getContext("2d")!;
+  const hue = set % 360;
+  const sky = g.createLinearGradient(0, 0, 0, h);
+  sky.addColorStop(0, `hsl(${hue} 52% ${28 + (own % 7)}%)`);
+  sky.addColorStop(1, `hsl(${(hue + 38) % 360} 62% ${64 + (own % 9)}%)`);
+  g.fillStyle = sky;
+  g.fillRect(0, 0, w, h);
+  g.fillStyle = `hsl(${(hue + 190) % 360} 40% 22%)`;
+  g.beginPath();
+  g.moveTo(0, h);
+  g.lineTo(0, h * 0.66);
+  g.lineTo(w * 0.34, h * (0.46 + (own % 5) / 60));
+  g.lineTo(w * 0.62, h * 0.7);
+  g.lineTo(w, h * 0.52);
+  g.lineTo(w, h);
+  g.closePath();
+  g.fill();
+  g.fillStyle = `hsl(${(hue + 20) % 360} 90% 78%)`;
+  g.beginPath();
+  g.arc(w * (0.2 + (own % 11) / 24), h * 0.28, px / 12, 0, Math.PI * 2);
+  g.fill();
+  const uri = canvas.toDataURL("image/jpeg", 0.72);
+  drawn.set(key, uri);
+  return uri;
+}
+
+const THUMB_EXTS = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"];
+
+function looksLikeImage(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  return dot > 0 && THUMB_EXTS.includes(path.slice(dot + 1).toLowerCase());
+}
+
+// ---- Saved results --------------------------------------------------------
+// The snapshot the browser preview opens: 40 files across 15 sets, written
+// before someone cleared out the negatives folder.
+
+const SNAPSHOT_GONE = "/Volumes/Archive/scans/negatives/";
+const SNAPSHOT_RESIZED = new Set([
+  "/Users/you/Pictures/exports/reykjavik-0433.jpg",
+  "/Users/you/Downloads/ridge.jpg",
+]);
+
+function makeSnapshotGroups(): DupGroup[] {
+  const raw: [number, string[]][] = [
+    [
+      22_400_000,
+      [
+        "/Users/you/Archive/photos/scan-0001.tiff",
+        "/Volumes/Archive/scans/1998/scan-0001.tiff",
+        "/Volumes/Archive/scans/negatives/scan-0001.tiff",
+      ],
+    ],
+    [
+      22_400_000,
+      [
+        "/Users/you/Archive/photos/scan-0002.tiff",
+        "/Volumes/Archive/scans/negatives/scan-0002.tiff",
+      ],
+    ],
+    [
+      8_900_000,
+      [
+        "/Users/you/Pictures/2026/reykjavik-0433.jpg",
+        "/Volumes/Archive/media/2026/reykjavik-0433.jpg",
+        "/Users/you/Pictures/exports/reykjavik-0433.jpg",
+      ],
+    ],
+    [
+      5_100_000,
+      [
+        "/Users/you/Pictures/wallpapers/ridge.jpg",
+        "/Users/you/Downloads/ridge.jpg",
+        "/Users/you/Desktop/ridge copy.jpg",
+      ],
+    ],
+    [
+      2_240_000,
+      [
+        "/Users/you/Pictures/exports/sunset-final.jpg",
+        "/Users/you/Desktop/sunset-final copy.jpg",
+        "/Volumes/Archive/media/2026/sunset-final.jpg",
+        "/Users/you/Pictures/2026/backup/sunset-final.jpg",
+        "/Volumes/Archive/scans/negatives/sunset-final.jpg",
+      ],
+    ],
+    [
+      214_000,
+      [
+        "/Users/you/Downloads/invoice-2214.pdf",
+        "/Users/you/Documents/Invoices/invoice-2214.pdf",
+        "/Users/you/Archive/2019/old-invoice-2214.pdf",
+      ],
+    ],
+    [
+      1_240_000_000,
+      [
+        "/Users/you/Desktop/meeting recording.mov",
+        "/Volumes/Archive/media/renders/meeting recording.mov",
+      ],
+    ],
+    [
+      3_400_000,
+      [
+        "/Users/you/Pictures/headshot.png",
+        "/Users/you/Downloads/headshot.png",
+        "/Users/you/Documents/press/headshot.png",
+      ],
+    ],
+    [
+      41_300_000,
+      [
+        "/Users/you/Music/demos/first-take.wav",
+        "/Users/you/Music/demos/backup/first-take.wav",
+      ],
+    ],
+    [
+      48_200_000,
+      [
+        "/Users/you/Documents/Q3 board deck.key",
+        "/Users/you/Desktop/Q3 board deck.key",
+      ],
+    ],
+    [
+      88_500_000,
+      [
+        "/Users/you/Downloads/dataset-v3.csv",
+        "/Volumes/Archive/media/dataset-v3.csv",
+      ],
+    ],
+    [
+      920_000,
+      [
+        "/Users/you/Documents/apartment lease signed.pdf",
+        "/Users/you/Downloads/apartment lease signed.pdf",
+        "/Users/you/Archive/2019/apartment lease signed.pdf",
+      ],
+    ],
+    [
+      61_800_000,
+      [
+        "/Users/you/Pictures/2026/reykjavik-0431.jpg",
+        "/Volumes/Archive/media/2026/reykjavik-0431.jpg",
+      ],
+    ],
+    [
+      12_900_000,
+      [
+        "/Users/you/Downloads/font-plex.zip",
+        "/Users/you/Desktop/font-plex.zip",
+      ],
+    ],
+    [
+      18_400,
+      [
+        "/Users/you/Projects/atlas/assets/logo-mark.svg",
+        "/Users/you/Desktop/logo-mark.svg",
+        "/Users/you/Downloads/logo-mark.svg",
+      ],
+    ],
+  ];
+  return raw.map(([size, paths], i) => ({
+    hash: `5${i.toString(16).padStart(2, "0")}c41ab97e0d2f`,
+    size,
+    paths,
+  }));
 }
 
 // Name matching returns leads, not proof, so the mock has to carry the two
@@ -431,7 +663,8 @@ function makeCopyGroups(): NameGroup[] {
     const drift = i % 3 === 0;
     const files = Array.from({ length: copies }, (_, c) => ({
       path: `${folders[(i + c * 2) % folders.length]}/${name}${c === 0 ? "" : ` ${markers[(i + c) % markers.length]}`}.${ext}`,
-      size: c === 0 || !drift ? size : Math.round(size * (c === 1 ? 0.62 : 1.4)),
+      size:
+        c === 0 || !drift ? size : Math.round(size * (c === 1 ? 0.62 : 1.4)),
       modified_ns: daysAgoNs(12 + i * 3 + c * 9),
       marker: c === 0 ? null : markers[(i + c) % markers.length],
       stripped: [],
@@ -863,6 +1096,11 @@ function mockBridge(): Bridge {
   const appDataDir =
     "/Users/you/Library/Application Support/com.parham.fileorganizer";
   let appDataBytes = 50_412_000;
+  const thumbsDir = "/Users/you/Library/Caches/com.parham.fileorganizer/thumbs";
+  let thumbsBytes = 18_940_000;
+  // The last results written to a file in this session, so opening a saved file
+  // gives back what was actually saved.
+  let lastExport: ResultSnapshot | null = null;
   let cancelRamp: (() => void) | null = null;
   const roots = [
     "/Users/you/Documents",
@@ -874,6 +1112,9 @@ function mockBridge(): Bridge {
     "/Users/you/Pictures": 11_340,
     "/Volumes/Archive/scans": 4_265,
   };
+  // The external drive in this mock is unplugged: its rows stay searchable, but
+  // nothing under it can be opened or hashed.
+  const reachable = (path: string) => !path.startsWith("/Volumes/");
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
@@ -1011,6 +1252,12 @@ function mockBridge(): Bridge {
       }
       case "list_indexed_roots":
         return [...roots] as T;
+      case "indexed_roots_status":
+        return roots.map((path) => ({
+          path,
+          available: reachable(path),
+          file_count: rootRows[path] ?? 0,
+        })) as RootStatus[] as T;
       case "remove_indexed_root": {
         const path = String(args.path ?? "");
         const at = roots.indexOf(path);
@@ -1063,6 +1310,8 @@ function mockBridge(): Bridge {
           group_count: groups.length,
           groups,
           cancelled,
+          unavailable_roots: [],
+          unreadable_files: 12,
         } as DupScanResult as T;
       }
       case "scan_duplicates_indexed": {
@@ -1082,6 +1331,8 @@ function mockBridge(): Bridge {
           group_count: groups.length,
           groups,
           cancelled,
+          unavailable_roots: roots.filter((r) => !reachable(r)),
+          unreadable_files: 37,
         } as DupScanResult as T;
       }
       case "scan_similar_images": {
@@ -1095,6 +1346,8 @@ function mockBridge(): Bridge {
         return {
           groups: cancelled ? all.slice(0, 1) : all,
           cancelled,
+          unavailable_roots: [],
+          unreadable_files: 6,
         } as SimilarScanResult as T;
       }
       case "scan_similar_names": {
@@ -1106,13 +1359,17 @@ function mockBridge(): Bridge {
           args.root ? 6_400 : indexed,
           slow ? 3200 : 2400,
         );
-        const all =
-          strategy === "media" ? makeMediaGroups() : makeCopyGroups();
-        const groups = cancelled ? all.slice(0, Math.ceil(all.length / 3)) : all;
+        const all = strategy === "media" ? makeMediaGroups() : makeCopyGroups();
+        const groups = cancelled
+          ? all.slice(0, Math.ceil(all.length / 3))
+          : all;
         return {
           group_count: groups.length,
           groups,
           cancelled,
+          unavailable_roots: args.root
+            ? []
+            : roots.filter((r) => !reachable(r)),
         } as NameScanResult as T;
       }
       case "index_content": {
@@ -1315,7 +1572,84 @@ function mockBridge(): Bridge {
           dir: appDataDir,
           bytes: appDataBytes,
           trashed_files: trash.filter((t) => !t.restored).length,
+          thumbs_dir: thumbsDir,
+          thumbs_bytes: thumbsBytes,
         } as AppDataSummary as T;
+      case "get_thumbnails": {
+        const paths = ((args.paths as string[]) ?? []).slice(0, 200);
+        const px = Math.min(512, Math.max(16, Number(args.maxPx ?? 96)));
+        // A real drive answers over milliseconds, not instantly. The delay is
+        // what makes the placeholder and the fade-in visible in the preview.
+        await new Promise((r) => setTimeout(r, 220));
+        return paths.map((path) => {
+          if (!looksLikeImage(path))
+            return { path, data_uri: null, error: null };
+          if (path.startsWith(SNAPSHOT_GONE))
+            return { path, data_uri: null, error: "not available" };
+          return { path, data_uri: mockThumb(path, px), error: null };
+        }) as Thumb[] as T;
+      }
+      case "clear_thumbnail_cache": {
+        const freed = thumbsBytes;
+        thumbsBytes = 0;
+        drawn.clear();
+        return freed as T;
+      }
+      case "export_results": {
+        await new Promise((r) => setTimeout(r, 260));
+        // Reading back what was just written is the whole point of the pair, so
+        // the preview remembers it and hands it to the next import.
+        lastExport = {
+          format: "fileorganizer.results",
+          version: 1,
+          kind: String(args.kind),
+          created_ns: Date.now() * 1e6,
+          app_version: "0.10.0",
+          scope: (args.scope as string | null) ?? null,
+          note: (args.note as string | null) ?? null,
+          payload: args.payload,
+        };
+        return undefined as T;
+      }
+      case "import_results": {
+        await new Promise((r) => setTimeout(r, 320));
+        if (lastExport) return lastExport as T;
+        const groups = makeSnapshotGroups();
+        return {
+          format: "fileorganizer.results",
+          version: 1,
+          kind: "duplicates",
+          created_ns: daysAgoNs(7),
+          app_version: "0.10.0",
+          scope: null,
+          note: "BLAKE3",
+          payload: {
+            group_count: groups.length,
+            groups,
+            cancelled: false,
+            unavailable_roots: [],
+            unreadable_files: 0,
+          },
+        } as ResultSnapshot as T;
+      }
+      case "verify_snapshot_paths": {
+        const checks =
+          (args.paths as { path: string; expected_size?: number }[]) ?? [];
+        await new Promise((r) => setTimeout(r, 180));
+        return checks.map(({ path, expected_size }) => {
+          if (path.startsWith(SNAPSHOT_GONE))
+            return { path, exists: false, size: null, size_changed: null };
+          const size = SNAPSHOT_RESIZED.has(path)
+            ? Math.round((expected_size ?? 0) * 1.4) + 4096
+            : (expected_size ?? 0);
+          return {
+            path,
+            exists: true,
+            size,
+            size_changed: expected_size != null && size !== expected_size,
+          };
+        }) as PathStatus[] as T;
+      }
       case "reset_app_data": {
         const pending = trash.filter((t) => !t.restored).length;
         if (pending > 0)
@@ -1665,6 +1999,9 @@ function mockBridge(): Bridge {
       return () => set!.delete(h);
     },
     pickFolder: async () => "/Users/you/Downloads",
+    pickSaveFile: async (defaultPath) => `/Users/you/Desktop/${defaultPath}`,
+    pickOpenFile: async () =>
+      "/Users/you/Desktop/fileorganizer-duplicates-2026-08-24.json",
   };
 }
 
@@ -1691,6 +2028,16 @@ export async function listen<T>(
 
 export async function pickFolder(): Promise<string | null> {
   return (await get()).pickFolder();
+}
+
+export async function pickSaveFile(
+  defaultPath: string,
+): Promise<string | null> {
+  return (await get()).pickSaveFile(defaultPath);
+}
+
+export async function pickOpenFile(): Promise<string | null> {
+  return (await get()).pickOpenFile();
 }
 
 export const isDesktop = IN_TAURI;

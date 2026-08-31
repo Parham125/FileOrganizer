@@ -29,7 +29,7 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --title "FileOrganizer $TAG" \
-              --notes "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. See assets below."
+              --notes "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. Linux: .deb, .rpm and .AppImage for x86_64, built on Ubuntu 22.04 so they need 22.04 or newer. See assets below."
           fi
           echo "release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)" >> "$GITHUB_OUTPUT"
 
@@ -48,10 +48,27 @@ jobs:
           - platform: macos-latest
             args: "--target universal-apple-darwin"
             targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          # Pinned to the oldest image we support rather than ubuntu-latest:
+          # glibc is forward but not backward compatible, so bundles built on
+          # 24.04 refuse to start on 22.04. Building here is what makes the
+          # "22.04 and newer" support floor actually true.
+          - platform: ubuntu-22.04
+            args: ""
+            targets: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+
+      # Tauri v2 needs the webkit2gtk 4.1 series; v1 used 4.0 and the names are
+      # not interchangeable. libdbus-1-dev is ours rather than Tauri's: keyring
+      # pulls dbus-secret-service on Linux and its libdbus-sys build script
+      # resolves dbus-1 through pkg-config with no vendored fallback.
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf build-essential curl wget file libxdo-dev libssl-dev libdbus-1-dev pkg-config xdg-utils
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -87,7 +104,7 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           releaseName: "FileOrganizer ${{ github.ref_name }}"
-          releaseBody: "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. See assets below."
+          releaseBody: "Installers built by CI. Windows: NSIS (.exe) and MSI (.msi). macOS: universal .dmg for Apple Silicon and Intel, unsigned. Linux: .deb, .rpm and .AppImage for x86_64, built on Ubuntu 22.04 so they need 22.04 or newer. See assets below."
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

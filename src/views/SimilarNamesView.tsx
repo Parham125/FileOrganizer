@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatDate, formatSize } from "../format";
+import { SMALL_PX, isImage, useThumbs } from "../thumbs";
+import { errorText, exportResults, isChanged, isMissing } from "../snapshot";
+import type { LoadedSnapshot, NamePayload, Verification } from "../snapshot";
 import type {
   NameGroup,
   NameScanResult,
@@ -8,7 +11,16 @@ import type {
   Progress,
   ScanMode,
 } from "../types";
+import { NameCoverageNote } from "../components/CoverageNote";
 import Pager from "../components/Pager";
+import SnapshotBanner, {
+  ChangedTag,
+  ExportButton,
+  MissingTag,
+  OpenSavedButton,
+  SnapshotNote,
+} from "../components/SnapshotBanner";
+import { ThumbSlot } from "../components/Thumb";
 import ResultFilters, {
   NoFilterMatch,
   useGroupFilter,
@@ -59,10 +71,18 @@ export default function SimilarNamesView({
   scanMode,
   onScanMode,
   onExact,
+  incoming,
+  onAdopted,
+  onOpenSaved,
+  openBusy,
 }: {
   scanMode: ScanMode;
   onScanMode: (m: ScanMode) => void;
   onExact: () => void;
+  incoming: LoadedSnapshot | null;
+  onAdopted: () => void;
+  onOpenSaved: () => void;
+  openBusy: boolean;
 }) {
   const [strategy, setStrategy] = useState<NameStrategy>("copies");
   const [scope, setScope] = useState<NameScope>("indexed");
@@ -81,9 +101,16 @@ export default function SimilarNamesView({
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
+  const [awayRoots, setAwayRoots] = useState<string[]>([]);
+  const [loaded, setLoaded] = useState<LoadedSnapshot | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saved, setSaved] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
   const files = useFileActions();
+  const gone = (path: string) =>
+    loaded != null && isMissing(loaded.checked, path);
 
   function goPage(next: number) {
     setPage(next);
@@ -112,6 +139,27 @@ export default function SimilarNamesView({
     setPage(0);
   }, [filter.query, filter.ext, filter.minMb]);
 
+  // A snapshot the page handed down. Nothing is preselected here for the same
+  // reason a live name scan preselects nothing: these files only share a name.
+  useEffect(() => {
+    if (!incoming || incoming.snap.kind !== "similar_names") return;
+    const payload = incoming.snap.payload as NamePayload;
+    const next = payload.groups ?? [];
+    setLoaded(incoming);
+    setGroups(next);
+    setGroupCount(payload.group_count ?? next.length);
+    setAwayRoots(payload.unavailable_roots ?? []);
+    setStopped(payload.cancelled ?? false);
+    if (payload.strategy) setStrategy(payload.strategy);
+    setScanned(null);
+    setSelection({});
+    setPage(0);
+    setError("");
+    setDone("");
+    setSaved("");
+    onAdopted();
+  }, [incoming, onAdopted]);
+
   function chooseScope(next: NameScope) {
     chosen.current = true;
     setScope(next);
@@ -130,10 +178,14 @@ export default function SimilarNamesView({
     }
     setError("");
     setDone("");
+    setSaved("");
+    setSaveError("");
     setStopped(false);
     setScanning(true);
     setProgress({ done: 0, total: 0 });
     setGroups(null);
+    setLoaded(null);
+    setAwayRoots([]);
     setSelection({});
     setPage(0);
     try {
@@ -145,19 +197,50 @@ export default function SimilarNamesView({
       setScanned(scope);
       setGroups(res.groups);
       setGroupCount(res.group_count);
+      setAwayRoots(res.unavailable_roots ?? []);
       setStopped(res.cancelled);
       // Nothing is preselected on purpose. These files only share a name, so
       // there is no copy the app can safely call redundant.
       setSelection({});
     } catch (e) {
-      setError(`Scan failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Scan failed: ${errorText(e)}`);
     } finally {
       setScanning(false);
       setProgress(null);
     }
   }
 
+  async function save() {
+    if (!groups) return;
+    setSaving(true);
+    setSaveError("");
+    setSaved("");
+    try {
+      const path = await exportResults(
+        "similar_names",
+        scanned === "folder" ? root : null,
+        media ? "the Same title strategy" : "the Copies strategy",
+        {
+          group_count: groupCount,
+          groups,
+          cancelled: stopped,
+          unavailable_roots: awayRoots,
+          strategy,
+        } satisfies NamePayload,
+      );
+      if (path)
+        setSaved(
+          `Saved ${groups.length.toLocaleString()} sets to ${path}. Open it again from any duplicate mode.`,
+        );
+    } catch (e) {
+      setSaveError(`Nothing was saved: ${errorText(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function toggle(key: string, path: string) {
+    if (gone(path)) return;
     setSelection((prev) => {
       const next = new Set(prev[key] ?? []);
       if (next.has(path)) next.delete(path);
@@ -179,14 +262,15 @@ export default function SimilarNamesView({
     for (const g of groups ?? []) {
       const sel = selection[keyOf(g)];
       if (!sel || sel.size === 0) continue;
-      if (sel.size >= g.files.length) invalid++;
+      const live = g.files.filter((f) => !gone(f.path)).length;
+      if (sel.size >= live) invalid++;
       sets++;
       count += sel.size;
       for (const f of g.files) if (sel.has(f.path)) bytes += f.size;
       for (const p of sel) if (!filter.shows(p)) hidden++;
     }
     return { count, bytes, invalid, sets, hidden };
-  }, [groups, selection, filter.shows]);
+  }, [groups, selection, filter.shows, loaded]);
 
   const nothingIndexed = roots !== null && roots.length === 0;
   const listed = filter.filtered?.length ?? 0;
@@ -196,6 +280,12 @@ export default function SimilarNamesView({
     ? filter.filtered.slice(from, from + PER_PAGE)
     : [];
   const media = strategy === "media";
+  // Only the sets on this page. Nothing off screen is ever requested, and what
+  // has already arrived is served from the module cache when paging back.
+  const thumb = useThumbs(
+    shown.flatMap((g) => g.files.map((f) => f.path)),
+    SMALL_PX,
+  );
 
   async function trashSelected() {
     const paths: string[] = [];
@@ -223,9 +313,7 @@ export default function SimilarNamesView({
         `Moved ${paths.length} ${paths.length === 1 ? "file" : "files"} to Trash and freed ${formatSize(freed)}. Restore anytime from Trash.`,
       );
     } catch (e) {
-      setError(
-        `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      setError(`Could not move files: ${errorText(e)}`);
       setConfirming(false);
     }
   }
@@ -243,6 +331,10 @@ export default function SimilarNamesView({
           ]}
         />
         <div className="flex flex-wrap items-center gap-2">
+          {groups && groups.length > 0 && !loaded && (
+            <ExportButton onExport={save} busy={saving} kind="similar_names" />
+          )}
+          <OpenSavedButton onOpen={onOpenSaved} busy={openBusy} />
           {scope === "folder" && (
             <button
               type="button"
@@ -270,7 +362,23 @@ export default function SimilarNamesView({
         </div>
       </div>
 
-      {scope === "folder" && root && (
+      <SnapshotNote error={saveError} done={saved} />
+
+      {loaded && groups && (
+        <SnapshotBanner
+          loaded={loaded}
+          summary={`${groupCount.toLocaleString()} ${groupCount === 1 ? "set" : "sets"}`}
+          onClose={() => {
+            setLoaded(null);
+            setGroups(null);
+            setSelection({});
+            setAwayRoots([]);
+            setStopped(false);
+          }}
+        />
+      )}
+
+      {scope === "folder" && root && !loaded && (
         <p className="truncate font-mono text-xs text-ink-soft">
           <span className="text-ink-faint">Target </span>
           {root}
@@ -413,6 +521,8 @@ export default function SimilarNamesView({
             </button>
           </div>
 
+          <NameCoverageNote roots={awayRoots} />
+
           <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
             <span className="text-ink-soft">
               <span className="font-semibold text-ink">
@@ -459,6 +569,8 @@ export default function SimilarNamesView({
                     selected={selection[keyOf(g)] ?? new Set<string>()}
                     onToggle={(p) => toggle(keyOf(g), p)}
                     files={files}
+                    thumb={thumb}
+                    checked={loaded?.checked ?? null}
                   />
                 ))}
               </div>
@@ -573,15 +685,22 @@ function NameGroupCard({
   selected,
   onToggle,
   files,
+  thumb,
+  checked,
 }: {
   group: NameGroup;
   selected: Set<string>;
   onToggle: (path: string) => void;
   files: ReturnType<typeof useFileActions>;
+  thumb: (path: string) => string | null | undefined;
+  checked: Verification | null;
 }) {
   const media = group.strategy === "media";
   const largest = Math.max(...group.files.map((f) => f.size), 1);
   const smallest = Math.min(...group.files.map((f) => f.size));
+  // One image in the set gives the whole set a preview column, so the rows stay
+  // lined up whether or not a given preview ever arrives.
+  const previews = group.files.some((f) => isImage(f.path));
   return (
     <div className="rounded-lg border border-line bg-surface">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
@@ -622,6 +741,7 @@ function NameGroupCard({
       <ul>
         {group.files.map((f) => {
           const remove = selected.has(f.path);
+          const lost = checked != null && isMissing(checked, f.path);
           const cut = Math.max(
             f.path.lastIndexOf("/"),
             f.path.lastIndexOf("\\"),
@@ -637,28 +757,54 @@ function NameGroupCard({
             <li key={f.path}>
               <div
                 onDoubleClick={() => files.open(f.path)}
-                className="flex items-start gap-2 border-b border-line/60 px-4 py-3 last:border-b-0 hover:bg-surface-2/50"
+                className={
+                  "flex items-start gap-2 border-b border-line/60 px-4 py-3 last:border-b-0 " +
+                  (lost ? "bg-surface-2/40" : "hover:bg-surface-2/50")
+                }
               >
-                <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-3">
+                <label
+                  className={
+                    "flex min-w-0 flex-1 items-start gap-3 " +
+                    (lost ? "cursor-default" : "cursor-pointer")
+                  }
+                >
                   <span
                     className={
                       "mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
-                      (remove
-                        ? "border-brick bg-brick text-white"
-                        : "border-line-strong bg-surface")
+                      (lost
+                        ? "border-line bg-surface-2"
+                        : remove
+                          ? "border-brick bg-brick text-white"
+                          : "border-line-strong bg-surface")
                     }
                   >
                     <input
                       type="checkbox"
                       checked={remove}
+                      disabled={lost}
                       onChange={() => onToggle(f.path)}
-                      aria-label={`Remove ${name}`}
+                      aria-label={
+                        lost ? `${name} is missing` : `Remove ${name}`
+                      }
                       className="sr-only"
                     />
-                    {remove && <IconCheck className="h-3 w-3" />}
+                    {remove && !lost && <IconCheck className="h-3 w-3" />}
                   </span>
+                  {previews && (
+                    <ThumbSlot
+                      path={f.path}
+                      src={thumb(f.path)}
+                      size="h-10 w-10"
+                      dim={lost}
+                    />
+                  )}
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm text-ink">
+                    <span
+                      className={
+                        "block truncate text-sm " +
+                        (lost ? "text-ink-faint line-through" : "text-ink")
+                      }
+                    >
                       {name}
                     </span>
                     <span className="block truncate font-mono text-xs text-ink-faint">
@@ -700,8 +846,18 @@ function NameGroupCard({
                   <span className="block text-xs text-ink-faint">
                     {formatDate(f.modified_ns) || "no date"}
                   </span>
-                  {remove && (
-                    <span className="block text-xs text-brick">Remove</span>
+                  {lost ? (
+                    <span className="mt-1 block">
+                      <MissingTag />
+                    </span>
+                  ) : checked != null && isChanged(checked, f.path) ? (
+                    <span className="mt-1 block">
+                      <ChangedTag />
+                    </span>
+                  ) : (
+                    remove && (
+                      <span className="block text-xs text-brick">Remove</span>
+                    )
                   )}
                 </span>
                 <RevealButton

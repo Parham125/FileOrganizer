@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "../bridge";
 import { formatRelative, formatSize } from "../format";
-import type { StorageStats } from "../types";
+import type { RootStatus, StorageStats } from "../types";
 import PageHeader from "../components/PageHeader";
 import RevealButton from "../components/FileActions";
 import { IconCheck, IconRestore, IconTrash } from "../components/icons";
 
 export default function InsightsView() {
   const [stats, setStats] = useState<StorageStats | null>(null);
+  const [away, setAway] = useState<RootStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -16,6 +17,16 @@ export default function InsightsView() {
     setLoading(true);
     try {
       setStats(await invoke<StorageStats>("storage_stats"));
+      // These totals are read from the index, which keeps every row of a drive
+      // that is currently unplugged. Saying so is the difference between a
+      // number the reader can act on and one they cannot.
+      setAway(
+        (
+          await invoke<RootStatus[]>("indexed_roots_status").catch(
+            () => [] as RootStatus[],
+          )
+        ).filter((r) => !r.available),
+      );
       setError("");
     } catch (e) {
       setError(
@@ -157,6 +168,20 @@ export default function InsightsView() {
               </span>{" "}
               of that.
             </p>
+            {away.length > 0 && (
+              <p className="mt-2.5 max-w-lg text-sm leading-relaxed text-ink-soft">
+                Counts{" "}
+                <span className="font-mono font-medium tabular-nums text-ink">
+                  {away.reduce((s, r) => s + r.file_count, 0).toLocaleString()}
+                </span>{" "}
+                files on{" "}
+                {away.length === 1
+                  ? "a drive that is"
+                  : `${away.length} drives that are`}{" "}
+                not connected right now, so that space cannot be reclaimed until{" "}
+                {away.length === 1 ? "it is" : "they are"} plugged back in.
+              </p>
+            )}
           </div>
 
           <section className="space-y-3">

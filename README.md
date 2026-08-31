@@ -8,7 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/Parham125/FileOrganizer?color=2f6f5e&label=release&style=flat-square)](https://github.com/Parham125/FileOrganizer/releases)
 [![Downloads](https://img.shields.io/github/downloads/Parham125/FileOrganizer/total?color=2f6f5e&style=flat-square)](https://github.com/Parham125/FileOrganizer/releases)
 [![License](https://img.shields.io/github/license/Parham125/FileOrganizer?color=2f6f5e&style=flat-square)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-2f6f5e?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-2f6f5e?style=flat-square)
 ![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white&style=flat-square)
 ![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white&style=flat-square)
 ![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white&style=flat-square)
@@ -34,7 +34,18 @@ Grab the latest installer from the [**Releases**](https://github.com/Parham125/F
 Both are built from source by GitHub Actions on every release tag. The app is not code-signed, so SmartScreen warns on first run. Choose **More info -> Run anyway**.
 
 ### macOS
-No signed build yet. [Build it from source](#develop) (one command), or open the locally built `.dmg`. On first open, right-click the app and choose **Open** to get past Gatekeeper.
+Take **`FileOrganizer_universal.dmg`** from the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page. It is a universal build, so it runs natively on Apple Silicon and Intel.
+
+It is not signed or notarized, so Gatekeeper blocks it on first open: right-click the app and choose **Open**, or run `xattr -cr /Applications/FileOrganizer.app`. For the same reason the app cannot update itself on macOS (a freshly downloaded bundle is quarantined again, and Gatekeeper refuses it), so it tells you when a new version exists and links to the release instead. Windows and the Linux AppImage do update in place.
+
+### Linux
+x86_64 builds are on the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page. Pick by distro:
+
+- **`.deb`** for Debian and Ubuntu
+- **`.rpm`** for Fedora and other RPM distros
+- **`.AppImage`** for anything else (`chmod +x` it and run it)
+
+Built on Ubuntu 22.04, so they need **22.04 or newer** and equivalents (glibc 2.35+). Older distributions are not supported. Like the Windows and macOS builds, nothing here is signed. Take the `.AppImage` if you want in-app updates: it is the only Linux format Tauri's updater can replace in place, so a `.deb` or `.rpm` install has to be updated by downloading the new one.
 
 ---
 
