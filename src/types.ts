@@ -28,6 +28,19 @@ export type ContentHit = {
   snippet: string;
 };
 
+export type ExtStat = {
+  ext: string;
+  count: number;
+  total_size: number;
+};
+
+export type StorageStats = {
+  files: number;
+  total_size: number;
+  largest: SearchHit[];
+  by_ext: ExtStat[];
+};
+
 export type TrashItem = {
   id: string;
   op_id: string;
@@ -43,6 +56,7 @@ export type Progress = { done: number; total: number };
 export type ViewId =
   | "search"
   | "duplicates"
+  | "insights"
   | "organize"
   | "assistant"
   | "trash"

@@ -5,6 +5,7 @@ import type { HashAlgo, ViewId } from "./types";
 import Sidebar from "./components/Sidebar";
 import SearchView from "./views/SearchView";
 import DuplicatesView from "./views/DuplicatesView";
+import InsightsView from "./views/InsightsView";
 import OrganizeView from "./views/OrganizeView";
 import AssistantView from "./views/AssistantView";
 import TrashView from "./views/TrashView";
@@ -40,6 +41,7 @@ export default function App() {
             <SearchView indexed={indexed} onIndexed={setIndexed} />
           )}
           {view === "duplicates" && <DuplicatesView algo={algo} />}
+          {view === "insights" && <InsightsView />}
           {view === "organize" && (
             <OrganizeView model={model} onGoSettings={goSettings} />
           )}

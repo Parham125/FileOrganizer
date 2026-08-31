@@ -30,6 +30,14 @@ pub struct ContentHit {
     pub snippet: String,
 }
 
+/// Aggregate file count and total size for one extension.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtStat {
+    pub ext: String,
+    pub count: i64,
+    pub total_size: i64,
+}
+
 /// Full-text search index backed by SQLite FTS5 (trigram tokenizer).
 pub struct Index {
     conn: Connection,
@@ -126,6 +134,45 @@ impl Index {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
+    }
+
+    /// Total bytes across every indexed file.
+    pub fn total_size(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM files", [], |r| r.get(0))?)
+    }
+
+    /// The largest indexed files, biggest first.
+    pub fn largest_files(&self, limit: i64) -> Result<Vec<SearchHit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, name, size, modified_ns FROM files ORDER BY size DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(SearchHit {
+                path: r.get(0)?,
+                name: r.get(1)?,
+                size: r.get(2)?,
+                modified_ns: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Size and count grouped by extension, largest total first.
+    pub fn size_by_ext(&self, limit: i64) -> Result<Vec<ExtStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(NULLIF(ext, ''), '(none)') AS e, COUNT(*), COALESCE(SUM(size), 0) AS t
+             FROM files GROUP BY e ORDER BY t DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(ExtStat {
+                ext: r.get(0)?,
+                count: r.get(1)?,
+                total_size: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn search(&self, query: &str, opts: &SearchOpts) -> Result<Vec<SearchHit>> {
@@ -235,6 +282,28 @@ mod tests {
     use super::*;
     use fo_indexer::{FileSource, WalkdirSource};
     use std::fs;
+
+    #[test]
+    fn storage_stats_aggregate_by_size_and_ext() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("big.bin"), vec![0u8; 5000]).unwrap();
+        fs::write(dir.path().join("small.bin"), vec![0u8; 100]).unwrap();
+        fs::write(dir.path().join("note.txt"), vec![0u8; 400]).unwrap();
+        let entries = WalkdirSource.enumerate(dir.path()).unwrap();
+        let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
+        idx.upsert_batch(&entries).unwrap();
+        assert_eq!(idx.total_size().unwrap(), 5500);
+        let largest = idx.largest_files(2).unwrap();
+        assert_eq!(largest.len(), 2);
+        assert_eq!(largest[0].name, "big.bin");
+        assert_eq!(largest[1].name, "note.txt");
+        // bin (5100) outranks txt (400), and counts group correctly
+        let by_ext = idx.size_by_ext(10).unwrap();
+        assert_eq!(by_ext[0].ext, "bin");
+        assert_eq!(by_ext[0].count, 2);
+        assert_eq!(by_ext[0].total_size, 5100);
+        assert_eq!(by_ext[1].ext, "txt");
+    }
 
     #[test]
     fn index_and_substring_search() {

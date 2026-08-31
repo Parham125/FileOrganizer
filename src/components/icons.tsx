@@ -91,6 +91,15 @@ export const IconSpark = (p: P) => (
   </S>
 );
 
+export const IconInsights = (p: P) => (
+  <S {...p}>
+    <path d="M4 4v15a1 1 0 0 0 1 1h15" />
+    <path d="M7.5 8h10" />
+    <path d="M7.5 12.5h6.5" />
+    <path d="M7.5 17h3.5" />
+  </S>
+);
+
 export const IconOrganize = (p: P) => (
   <S {...p}>
     <path d="M3 6a2 2 0 0 1 2-2h3l1.5 1.5H19a2 2 0 0 1 2 2v2H3z" />

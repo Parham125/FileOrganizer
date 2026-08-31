@@ -3,12 +3,14 @@ import type {
   ChatMessage,
   ContentHit,
   DupGroup,
+  ExtStat,
   Move,
   PendingAction,
   Progress,
   SearchHit,
   SearchOpts,
   SimilarGroup,
+  StorageStats,
   TrashItem,
 } from "./types";
 
@@ -91,6 +93,60 @@ function makeFiles(): SearchHit[] {
     ["/Users/you/Archive/photos/scan-0001.tiff", 22_400_000, 610],
     ["/Users/you/Archive/photos/scan-0002.tiff", 22_400_000, 610],
     ["/Users/you/.cache/build/artifact.bin", 158_000_000, 1],
+  ];
+  return raw.map(([path, size, days]) => ({
+    path,
+    name: path.slice(path.lastIndexOf("/") + 1),
+    size,
+    modified_ns: daysAgoNs(days),
+  }));
+}
+
+function makeExtStats(): ExtStat[] {
+  const raw: [string, number, number][] = [
+    ["mp4", 1_204, 138_200_000_000],
+    ["raw", 3_180, 79_600_000_000],
+    ["mov", 212, 66_400_000_000],
+    ["zip", 946, 41_800_000_000],
+    ["wav", 1_502, 31_800_000_000],
+    ["flac", 2_744, 22_900_000_000],
+    ["tar", 88, 19_100_000_000],
+    ["jpg", 6_910, 15_300_000_000],
+    ["sql", 143, 10_400_000_000],
+    ["pdf", 2_318, 6_900_000_000],
+    ["png", 3_502, 4_400_000_000],
+    ["csv", 407, 3_900_000_000],
+  ];
+  return raw.map(([ext, count, total_size]) => ({ ext, count, total_size }));
+}
+
+function makeLargest(): SearchHit[] {
+  const raw: [string, number, number][] = [
+    ["/Users/you/Movies/Renders/reykjavik-cut-final.mov", 18_400_000_000, 3],
+    ["/Users/you/Movies/Renders/reykjavik-cut-v3.mov", 16_900_000_000, 11],
+    ["/Users/you/Movies/Footage/a7s-c0044.mp4", 12_600_000_000, 24],
+    ["/Users/you/Movies/Footage/a7s-c0043.mp4", 11_800_000_000, 24],
+    ["/Users/you/Movies/Footage/a7s-c0041.mp4", 9_400_000_000, 25],
+    ["/Users/you/Backups/atlas-2026-08-full.tar", 8_700_000_000, 2],
+    ["/Users/you/Movies/Renders/product-tour-master.mov", 7_900_000_000, 18],
+    ["/Users/you/Backups/atlas-2026-07-full.tar", 7_100_000_000, 33],
+    ["/Users/you/Movies/Footage/interview-cam-b.mp4", 6_400_000_000, 46],
+    ["/Users/you/Movies/Footage/interview-cam-a.mp4", 6_100_000_000, 46],
+    ["/Users/you/Pictures/2026/reykjavik-raw-bundle.zip", 5_800_000_000, 21],
+    ["/Users/you/Music/sessions/album-stems.zip", 4_900_000_000, 58],
+    ["/Users/you/Movies/Renders/teaser-30s-prores.mov", 4_200_000_000, 9],
+    ["/Users/you/Projects/atlas/dump-2026-08.sql", 3_800_000_000, 1],
+    ["/Users/you/VMs/ubuntu-dev.qcow2", 3_400_000_000, 6],
+    ["/Users/you/Music/sessions/first-take-multitrack.wav", 2_900_000_000, 15],
+    ["/Users/you/Downloads/xcode_16.4.xip", 2_600_000_000, 72],
+    ["/Users/you/Pictures/2026/lightroom-catalog.lrcat", 2_200_000_000, 0],
+    ["/Users/you/Movies/Footage/drone-0087.mp4", 1_900_000_000, 37],
+    ["/Users/you/Backups/photos-archive-2019.tar", 1_700_000_000, 214],
+    ["/Users/you/Desktop/meeting recording.mov", 1_240_000_000, 4],
+    ["/Users/you/Music/sessions/mixdown-24bit.wav", 1_100_000_000, 7],
+    ["/Users/you/Projects/atlas/node_modules.tar", 720_000_000, 14],
+    ["/Users/you/Downloads/setup-arm64.dmg", 512_000_000, 12],
+    ["/Users/you/Projects/atlas/dump-2026-07.sql", 340_000_000, 27],
   ];
   return raw.map(([path, size, days]) => ({
     path,
@@ -267,6 +323,9 @@ function mockBridge(): Bridge {
   const emit = (evt: string, payload: unknown) =>
     bus.get(evt)?.forEach((h) => h(payload));
   const files = makeFiles();
+  const byExt = makeExtStats();
+  let largest = makeLargest();
+  let storedSize = 460_100_000_000;
   let indexed = 24_817;
   let contentIndexed = 0;
   let watching = false;
@@ -312,6 +371,13 @@ function mockBridge(): Bridge {
         return "0.1.0 (browser preview)" as T;
       case "index_stats":
         return indexed as T;
+      case "storage_stats":
+        return {
+          files: indexed,
+          total_size: storedSize,
+          largest,
+          by_ext: byExt,
+        } as StorageStats as T;
       case "index_folder": {
         await ramp("index:progress", 8_421, 1400);
         indexed += 8_421;
@@ -366,16 +432,23 @@ function mockBridge(): Bridge {
         const op = "op_" + rid();
         opOrder.unshift(op);
         for (const p of paths) {
+          const size =
+            files.find((f) => f.path === p)?.size ??
+            largest.find((f) => f.path === p)?.size ??
+            0;
           trash.unshift({
             id: rid(),
             op_id: op,
             original_path: p,
-            size: files.find((f) => f.path === p)?.size ?? 0,
+            size,
             deleted_ns: Date.now() * 1e6,
             reason,
             restored: false,
           });
+          storedSize -= size;
+          indexed -= 1;
         }
+        largest = largest.filter((f) => !paths.includes(f.path));
         emit("index:changed", undefined);
         return op as T;
       }

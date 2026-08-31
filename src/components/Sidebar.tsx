@@ -3,6 +3,7 @@ import Logo from "./Logo";
 import {
   IconAssistant,
   IconDuplicates,
+  IconInsights,
   IconMoon,
   IconOrganize,
   IconSearch,
@@ -15,6 +16,7 @@ const NAV: { id: ViewId; label: string; Icon: (p: { className?: string }) => Rea
   [
     { id: "search", label: "Search", Icon: IconSearch },
     { id: "duplicates", label: "Duplicates", Icon: IconDuplicates },
+    { id: "insights", label: "Insights", Icon: IconInsights },
     { id: "organize", label: "Organize", Icon: IconOrganize },
     { id: "assistant", label: "Assistant", Icon: IconAssistant },
     { id: "trash", label: "Trash", Icon: IconTrash },

@@ -3,7 +3,7 @@ use fo_ai::OpenRouter;
 use fo_dedup::{find_duplicates, find_similar_images, DupGroup, SimilarGroup};
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
-use fo_search::{ContentHit, Index, SearchHit, SearchOpts};
+use fo_search::{ContentHit, ExtStat, Index, SearchHit, SearchOpts};
 use fo_trash::{Trash, TrashItem};
 use std::fs;
 use std::path::PathBuf;
@@ -74,6 +74,26 @@ fn index_stats(state: State<AppState>) -> Result<i64, String> {
         .unwrap()
         .count()
         .map_err(|e| e.to_string())
+}
+
+/// Disk-usage overview built from the index: totals, biggest files, size by type.
+#[derive(serde::Serialize)]
+struct StorageStats {
+    files: i64,
+    total_size: i64,
+    largest: Vec<SearchHit>,
+    by_ext: Vec<ExtStat>,
+}
+
+#[tauri::command]
+fn storage_stats(state: State<AppState>) -> Result<StorageStats, String> {
+    let idx = state.index.lock().unwrap();
+    Ok(StorageStats {
+        files: idx.count().map_err(|e| e.to_string())?,
+        total_size: idx.total_size().map_err(|e| e.to_string())?,
+        largest: idx.largest_files(25).map_err(|e| e.to_string())?,
+        by_ext: idx.size_by_ext(12).map_err(|e| e.to_string())?,
+    })
 }
 
 #[tauri::command]
@@ -477,6 +497,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_version,
             index_stats,
+            storage_stats,
             search,
             index_folder,
             index_content,

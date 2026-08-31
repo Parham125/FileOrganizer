@@ -46,6 +46,8 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 
 📄 **Search inside documents.** Index a folder once and full-text search the text inside your files: plain text, code, PDF, and DOCX.
 
+📊 **Storage insights.** See what is actually eating your disk: total indexed size, a size-by-type breakdown, and your biggest files, with the same open, reveal, and trash actions as search.
+
 🗂️ **AI organizer.** Point it at a messy folder and it proposes a tidy structure. You preview every move before anything happens, and it is fully reversible.
 
 💬 **AI assistant.** A chat that can actually act: it searches, scans for duplicates, and proposes changes using real tools. Read-only actions run on their own; anything that moves or trashes a file becomes a one-tap approval card showing exactly which files are affected.
