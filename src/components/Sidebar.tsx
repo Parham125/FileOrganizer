@@ -6,22 +6,27 @@ import {
   IconInsights,
   IconMoon,
   IconOrganize,
+  IconRules,
   IconSearch,
   IconSettings,
   IconSun,
   IconTrash,
 } from "./icons";
 
-const NAV: { id: ViewId; label: string; Icon: (p: { className?: string }) => React.ReactElement }[] =
-  [
-    { id: "search", label: "Search", Icon: IconSearch },
-    { id: "duplicates", label: "Duplicates", Icon: IconDuplicates },
-    { id: "insights", label: "Insights", Icon: IconInsights },
-    { id: "organize", label: "Organize", Icon: IconOrganize },
-    { id: "assistant", label: "Assistant", Icon: IconAssistant },
-    { id: "trash", label: "Trash", Icon: IconTrash },
-    { id: "settings", label: "Settings", Icon: IconSettings },
-  ];
+const NAV: {
+  id: ViewId;
+  label: string;
+  Icon: (p: { className?: string }) => React.ReactElement;
+}[] = [
+  { id: "search", label: "Search", Icon: IconSearch },
+  { id: "duplicates", label: "Duplicates", Icon: IconDuplicates },
+  { id: "insights", label: "Insights", Icon: IconInsights },
+  { id: "organize", label: "Organize", Icon: IconOrganize },
+  { id: "rules", label: "Rules", Icon: IconRules },
+  { id: "assistant", label: "Assistant", Icon: IconAssistant },
+  { id: "trash", label: "Trash", Icon: IconTrash },
+  { id: "settings", label: "Settings", Icon: IconSettings },
+];
 
 export default function Sidebar({
   view,
@@ -55,7 +60,7 @@ export default function Sidebar({
               onClick={() => onView(id)}
               aria-current={active ? "page" : undefined}
               className={
-                "group relative flex flex-1 items-center justify-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal md:flex-none md:justify-start " +
+                "group relative flex flex-1 items-center justify-center gap-2.5 rounded-md px-2 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal sm:px-3 md:flex-none md:justify-start " +
                 (active
                   ? "bg-surface text-ink shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
                   : "text-ink-soft hover:bg-surface/60 hover:text-ink")

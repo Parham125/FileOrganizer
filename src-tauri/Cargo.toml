@@ -26,6 +26,7 @@ fo-search.workspace = true
 fo-trash.workspace = true
 fo-ai.workspace = true
 fo-extract.workspace = true
+fo-rules.workspace = true
 tauri-plugin-opener = "2.5.4"
 
 [dev-dependencies]

@@ -48,6 +48,8 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 
 📊 **Storage insights.** See what is actually eating your disk: total indexed size, a size-by-type breakdown, and your biggest files, with the same open, reveal, and trash actions as search.
 
+⚙️ **Rules.** Save a filter and an action once (say, PDFs in Downloads older than 90 days go to an archive folder), see exactly which files match before you commit, then run it whenever you like. Every run goes through Trash, so it is undoable.
+
 🗂️ **AI organizer.** Point it at a messy folder and it proposes a tidy structure. You preview every move before anything happens, and it is fully reversible.
 
 💬 **AI assistant.** A chat that can actually act: it searches, scans for duplicates, and proposes changes using real tools. Read-only actions run on their own; anything that moves or trashes a file becomes a one-tap approval card showing exactly which files are affected.

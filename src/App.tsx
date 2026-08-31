@@ -7,6 +7,7 @@ import SearchView from "./views/SearchView";
 import DuplicatesView from "./views/DuplicatesView";
 import InsightsView from "./views/InsightsView";
 import OrganizeView from "./views/OrganizeView";
+import RulesView from "./views/RulesView";
 import AssistantView from "./views/AssistantView";
 import TrashView from "./views/TrashView";
 import SettingsView from "./views/SettingsView";
@@ -45,6 +46,7 @@ export default function App() {
           {view === "organize" && (
             <OrganizeView model={model} onGoSettings={goSettings} />
           )}
+          {view === "rules" && <RulesView />}
           {view === "assistant" && (
             <AssistantView model={model} onGoSettings={goSettings} />
           )}

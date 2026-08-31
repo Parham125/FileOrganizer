@@ -7,6 +7,9 @@ import type {
   Move,
   PendingAction,
   Progress,
+  Rule,
+  RuleFilter,
+  RuleRun,
   SearchHit,
   SearchOpts,
   SimilarGroup,
@@ -18,7 +21,8 @@ import type {
 // to the real commands; in a plain browser (pnpm dev) we serve believable mock
 // data so every view is usable and screenshot-able without the desktop shell.
 
-const IN_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const IN_TAURI =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 type UnlistenFn = () => void;
 type Handler<T> = (payload: T) => void;
@@ -251,6 +255,57 @@ function makeContentHits(query: string): ContentHit[] {
   }));
 }
 
+function makeRules(): Rule[] {
+  return [
+    {
+      id: rid(),
+      name: "Old invoices",
+      filter: { ext: "pdf", name_contains: "invoice", older_than_days: 90 },
+      action: { type: "MoveTo", folder: "/Users/you/Documents/Invoices" },
+      created_ns: daysAgoNs(64),
+      last_run_ns: daysAgoNs(3),
+      last_run_count: 12,
+    },
+    {
+      id: rid(),
+      name: "Big downloads",
+      filter: { min_size: 52_428_800, in_folder: "/Users/you/Downloads" },
+      action: { type: "Trash" },
+      created_ns: daysAgoNs(21),
+      last_run_ns: null,
+      last_run_count: 0,
+    },
+  ];
+}
+
+// Mirrors match_rule in the rules crate so the preview reacts to every edit.
+function matchFilter(files: SearchHit[], f: RuleFilter): SearchHit[] {
+  const cutoff =
+    f.older_than_days != null ? daysAgoNs(f.older_than_days) : null;
+  return files.filter((file) => {
+    if (f.name_contains) {
+      const needle = f.name_contains.toLowerCase();
+      if (!file.name.toLowerCase().includes(needle)) return false;
+    }
+    if (f.ext) {
+      const e = f.ext.replace(/^\./, "").toLowerCase();
+      if (!file.name.toLowerCase().endsWith("." + e)) return false;
+    }
+    if (f.min_size != null && file.size < f.min_size) return false;
+    if (f.max_size != null && file.size > f.max_size) return false;
+    if (
+      cutoff != null &&
+      (file.modified_ns == null || file.modified_ns > cutoff)
+    )
+      return false;
+    if (f.in_folder) {
+      const dir = f.in_folder.replace(/\/$/, "");
+      if (!file.path.startsWith(dir + "/")) return false;
+    }
+    return true;
+  });
+}
+
 function makeTrash(): TrashItem[] {
   const op1 = "op_" + rid();
   const op2 = "op_" + rid();
@@ -296,8 +351,16 @@ function makeMoves(root: string): Move[] {
     m("invoice-2215.pdf", "Documents/Invoices", "invoice-2215.pdf"),
     m("receipt.pdf", "Documents/Invoices", "receipt.pdf"),
     m("2026 tax return.pdf", "Documents/Taxes", "2026 tax return.pdf"),
-    m("apartment lease signed.pdf", "Documents/Contracts", "apartment lease signed.pdf"),
-    m("screenshot 2026-08-24.png", "Images/Screenshots", "screenshot 2026-08-24.png"),
+    m(
+      "apartment lease signed.pdf",
+      "Documents/Contracts",
+      "apartment lease signed.pdf",
+    ),
+    m(
+      "screenshot 2026-08-24.png",
+      "Images/Screenshots",
+      "screenshot 2026-08-24.png",
+    ),
     m("reykjavik-0433.jpg", "Images/Photos", "reykjavik-0433.jpg"),
     m("ridge.jpg", "Images/Photos", "ridge.jpg"),
   ];
@@ -311,7 +374,11 @@ function toolTurn(name: string, args: object, result: string): ChatMessage[] {
       role: "assistant",
       content: null,
       tool_calls: [
-        { id, type: "function", function: { name, arguments: JSON.stringify(args) } },
+        {
+          id,
+          type: "function",
+          function: { name, arguments: JSON.stringify(args) },
+        },
       ],
     },
     { role: "tool", tool_call_id: id, name, content: result },
@@ -332,6 +399,9 @@ function mockBridge(): Bridge {
   let hasKey = true;
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
+  const rules: Rule[] = makeRules();
+  // What each rule run took out of the mock index, so undo can put it back.
+  const undoable = new Map<string, { file: SearchHit; from: string }[]>();
 
   function ramp(evt: string, total: number, ms: number): Promise<void> {
     return new Promise((resolve) => {
@@ -393,7 +463,11 @@ function mockBridge(): Bridge {
           .toLowerCase();
         const opts = (args.opts ?? {}) as SearchOpts;
         let out = files.filter((f) => {
-          if (q && !f.name.toLowerCase().includes(q) && !f.path.toLowerCase().includes(q))
+          if (
+            q &&
+            !f.name.toLowerCase().includes(q) &&
+            !f.path.toLowerCase().includes(q)
+          )
             return false;
           if (opts.ext) {
             const e = opts.ext.replace(/^\./, "").toLowerCase();
@@ -475,7 +549,28 @@ function mockBridge(): Bridge {
         return (it?.original_path ?? "") as T;
       }
       case "undo_last": {
-        const op = opOrder.find((o) => trash.some((t) => t.op_id === o && !t.restored));
+        const move = opOrder.find((o) => undoable.has(o));
+        if (move && opOrder.indexOf(move) === 0) {
+          const back = undoable.get(move)!;
+          for (const { file, from } of back) {
+            file.path = from;
+            file.name = from.slice(from.lastIndexOf("/") + 1);
+            if (!files.includes(file)) {
+              files.push(file);
+              indexed += 1;
+              storedSize += file.size;
+            }
+          }
+          undoable.delete(move);
+          opOrder.shift();
+          for (let i = trash.length - 1; i >= 0; i--)
+            if (trash[i].op_id === move) trash.splice(i, 1);
+          emit("index:changed", undefined);
+          return back.map((b) => b.from) as T;
+        }
+        const op = opOrder.find((o) =>
+          trash.some((t) => t.op_id === o && !t.restored),
+        );
         const restored: string[] = [];
         if (op)
           for (const t of trash)
@@ -508,6 +603,78 @@ function mockBridge(): Bridge {
           if (trash[i].op_id === op) trash.splice(i, 1);
         emit("index:changed", undefined);
         return undefined as T;
+      }
+      case "list_rules":
+        return [...rules] as T;
+      case "create_rule": {
+        const rule: Rule = {
+          id: rid(),
+          name: String(args.name ?? "Untitled rule"),
+          filter: (args.filter ?? {}) as RuleFilter,
+          action: (args.action ?? { type: "Trash" }) as Rule["action"],
+          created_ns: Date.now() * 1e6,
+          last_run_ns: null,
+          last_run_count: 0,
+        };
+        rules.push(rule);
+        return rule as T;
+      }
+      case "update_rule": {
+        const next = args.rule as Rule;
+        const i = rules.findIndex((r) => r.id === next.id);
+        if (i >= 0) rules[i] = { ...rules[i], ...next };
+        return undefined as T;
+      }
+      case "delete_rule": {
+        const i = rules.findIndex((r) => r.id === String(args.id));
+        if (i >= 0) rules.splice(i, 1);
+        return undefined as T;
+      }
+      case "preview_rule": {
+        const limit = (args.limit as number) ?? 500;
+        return matchFilter(files, (args.filter ?? {}) as RuleFilter)
+          .sort((a, b) => b.size - a.size)
+          .slice(0, limit) as T;
+      }
+      case "run_rule": {
+        const rule = rules.find((r) => r.id === String(args.id));
+        if (!rule) throw new Error(`no rule with id ${args.id}`);
+        const hits = matchFilter(files, rule.filter);
+        const op = "op_" + rid();
+        if (hits.length > 0) {
+          opOrder.unshift(op);
+          const back: { file: SearchHit; from: string }[] = [];
+          for (const hit of hits) {
+            back.push({ file: hit, from: hit.path });
+            files.splice(files.indexOf(hit), 1);
+            indexed -= 1;
+            if (rule.action.type === "Trash") {
+              storedSize -= hit.size;
+              trash.unshift({
+                id: rid(),
+                op_id: op,
+                original_path: hit.path,
+                size: hit.size,
+                deleted_ns: Date.now() * 1e6,
+                reason: "rule",
+                restored: false,
+              });
+            } else {
+              const dir = rule.action.folder.replace(/\/$/, "");
+              hit.path = `${dir}/${hit.name}`;
+              files.push(hit);
+              indexed += 1;
+            }
+          }
+          undoable.set(op, back);
+        }
+        rule.last_run_ns = Date.now() * 1e6;
+        rule.last_run_count = hits.length;
+        emit("index:changed", undefined);
+        return {
+          op_id: hits.length > 0 ? op : "",
+          count: hits.length,
+        } as RuleRun as T;
       }
       case "set_api_key":
         hasKey = String(args.key ?? "").trim().length > 0;
@@ -586,7 +753,12 @@ function mockBridge(): Bridge {
           ...toolTurn("index_stats", {}, "24,817 files indexed."),
           { role: "assistant", content: reply },
         ];
-        return { messages, pending: [], final_text: reply, done: true } as AgentResult as T;
+        return {
+          messages,
+          pending: [],
+          final_text: reply,
+          done: true,
+        } as AgentResult as T;
       }
       case "ai_agent_continue": {
         const incoming = (args.messages as ChatMessage[]) ?? [];
@@ -599,18 +771,29 @@ function mockBridge(): Bridge {
           final_text = `Done. I moved ${approved} file${approved === 1 ? "" : "s"} to Trash and left the ${skipped} you skipped in place. Restore anything from the Trash view.`;
         else if (approved > 0)
           final_text = `Done. I moved ${approved} file${approved === 1 ? "" : "s"} to Trash. You can restore them anytime from the Trash view.`;
-        else final_text = "No problem, I left everything where it is. Nothing was changed.";
+        else
+          final_text =
+            "No problem, I left everything where it is. Nothing was changed.";
         const messages: ChatMessage[] = [...incoming];
         if (approved > 0) {
           const op = "op_" + rid();
           opOrder.unshift(op);
           messages.push(
-            ...toolTurn("trash_files", { count: approved }, `Moved ${approved} files to Trash.`),
+            ...toolTurn(
+              "trash_files",
+              { count: approved },
+              `Moved ${approved} files to Trash.`,
+            ),
           );
           emit("index:changed", undefined);
         }
         messages.push({ role: "assistant", content: final_text });
-        return { messages, pending: [], final_text, done: true } as AgentResult as T;
+        return {
+          messages,
+          pending: [],
+          final_text,
+          done: true,
+        } as AgentResult as T;
       }
       default:
         throw new Error(`Unknown command: ${cmd}`);

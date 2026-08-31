@@ -108,6 +108,18 @@ export const IconOrganize = (p: P) => (
   </S>
 );
 
+export const IconRules = (p: P) => (
+  <S {...p}>
+    <path d="M3.5 5h17l-6.5 7.5V19l-4 2v-8.5z" />
+  </S>
+);
+
+export const IconPlay = (p: P) => (
+  <S {...p}>
+    <path d="M7 4.8v14.4l12-7.2z" />
+  </S>
+);
+
 export const IconAssistant = (p: P) => (
   <S {...p}>
     <path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-4 3.5V16H6a2 2 0 0 1-2-2z" />

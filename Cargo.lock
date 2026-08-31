@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "fileorganizer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fo-ai",
@@ -1433,6 +1433,7 @@ dependencies = [
  "fo-extract",
  "fo-hasher",
  "fo-indexer",
+ "fo-rules",
  "fo-search",
  "fo-trash",
  "keyring",
@@ -1480,10 +1481,11 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fo-ai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fo-indexer",
+ "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1491,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "fo-dedup"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fo-hasher",
@@ -1505,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "fo-extract"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "pdf-extract",
@@ -1515,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "fo-hasher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1524,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "fo-indexer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "notify",
@@ -1534,8 +1536,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fo-rules"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "fo-indexer",
+ "fo-search",
+ "fo-trash",
+ "nanoid",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "fo-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fo-indexer",
@@ -1546,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "fo-trash"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "nanoid",
@@ -4218,6 +4235,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -4237,12 +4255,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots",
 ]
@@ -4277,7 +4297,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -6062,6 +6082,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

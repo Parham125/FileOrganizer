@@ -53,11 +53,37 @@ export type TrashItem = {
 
 export type Progress = { done: number; total: number };
 
+// Saved cleanups: a filter over the index plus one action. Both actions route
+// through the trash journal, so every run is undoable.
+export type RuleAction = { type: "Trash" } | { type: "MoveTo"; folder: string };
+
+export type RuleFilter = {
+  name_contains?: string | null;
+  ext?: string | null;
+  min_size?: number | null;
+  max_size?: number | null;
+  older_than_days?: number | null;
+  in_folder?: string | null;
+};
+
+export type Rule = {
+  id: string;
+  name: string;
+  filter: RuleFilter;
+  action: RuleAction;
+  created_ns: number;
+  last_run_ns: number | null;
+  last_run_count: number;
+};
+
+export type RuleRun = { op_id: string; count: number };
+
 export type ViewId =
   | "search"
   | "duplicates"
   | "insights"
   | "organize"
+  | "rules"
   | "assistant"
   | "trash"
   | "settings";

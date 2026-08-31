@@ -78,6 +78,12 @@ impl Index {
         Ok(Index { conn })
     }
 
+    /// Raw handle to the index DB so sibling crates (fo-rules) can run their own
+    /// parameterized queries over `files` without duplicating the schema.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn upsert_batch(&mut self, entries: &[FileEntry]) -> Result<usize> {
         let tx = self.conn.transaction()?;
         {
