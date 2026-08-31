@@ -1,0 +1,19 @@
+[package]
+name = "fo-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+sevenz-rust = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+# Encoder side, needed only to build a real .7z in the tests. Resolver 2 keeps
+# this feature out of non-test builds.
+sevenz-rust = { version = "0.6", features = ["compress"] }

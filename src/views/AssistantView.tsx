@@ -141,6 +141,59 @@ function ActivityNote({
   );
 }
 
+// The model's own working, kept subordinate to the answer: collapsed by
+// default, quieter type, and a second rail inside the turn's rail so it reads
+// as an aside on the thread rather than a second reply.
+function ReasoningNote({
+  text,
+  live,
+  rail,
+}: {
+  text: string;
+  live?: boolean;
+  rail?: boolean;
+}) {
+  return (
+    <details className="group">
+      <summary
+        className={
+          "relative flex cursor-pointer list-none items-center gap-1.5 rounded-[4px] text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal [&::-webkit-details-marker]:hidden " +
+          (rail ? "" : "px-1 ") +
+          (live ? "text-ink-soft" : "text-ink-faint")
+        }
+      >
+        <span
+          aria-hidden="true"
+          className={
+            "h-1.5 w-1.5 shrink-0 " +
+            (rail ? "absolute -left-[17px] " : "") +
+            (live
+              ? "bg-teal fo-pulse"
+              : "border border-ink-faint " +
+                (rail ? "bg-surface" : "bg-transparent"))
+          }
+        />
+        {live ? "Thinking" : "Reasoning"}
+        <svg
+          viewBox="0 0 24 24"
+          className="h-3 w-3 shrink-0 transition-transform group-open:rotate-90"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2.2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="m9 6 6 6-6 6" />
+        </svg>
+      </summary>
+      <div className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap border-l border-line pl-3 text-xs leading-relaxed text-ink-soft">
+        {text}
+      </div>
+    </details>
+  );
+}
+
 function Bubble({
   text,
   tail,
@@ -172,14 +225,18 @@ function TurnGroup({
   stream,
   waiting,
   pondering,
+  reasoning,
+  reasoningLive,
 }: {
   pieces: Piece[];
   stream?: string;
   waiting?: boolean;
   pondering?: boolean;
+  reasoning?: string;
+  reasoningLive?: boolean;
 }) {
   const extras = (stream ? 1 : 0) + (waiting ? 1 : 0) + (pondering ? 1 : 0);
-  const rail = pieces.length + extras > 1;
+  const rail = pieces.length + extras + (reasoning ? 1 : 0) > 1;
   const last = extras === 0 ? pieces.length - 1 : -1;
   return (
     <div
@@ -188,6 +245,9 @@ function TurnGroup({
         (rail ? "border-l border-teal-line pl-3.5" : "")
       }
     >
+      {reasoning ? (
+        <ReasoningNote rail={rail} live={reasoningLive} text={reasoning} />
+      ) : null}
       {pieces.map((p, i) =>
         p.kind === "prose" ? (
           <Bubble key={`p${i}`} text={p.text} tail={i === last} />
@@ -239,6 +299,10 @@ export default function AssistantView({
   const [error, setError] = useState("");
   const [needsKey, setNeedsKey] = useState(false);
   const [stream, setStream] = useState("");
+  const [reasoning, setReasoning] = useState("");
+  // Reasoning is not part of the saved transcript, so a resolved turn keeps its
+  // working here, under the group key that turn produced.
+  const [reasoned, setReasoned] = useState<Record<string, string>>({});
   const [live, setLive] = useState<Piece[]>([]);
   const [awaiting, setAwaiting] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
@@ -261,6 +325,8 @@ export default function AssistantView({
   // The text arriving right now. It is committed into the turn as its own piece
   // the moment the model reaches for a tool, so live and saved turns look alike.
   const bufRef = useRef("");
+  // Same contract as bufRef, on its own channel: bare fragments in arrival order.
+  const reasonRef = useRef("");
   const stickRef = useRef(true);
   const lastTopRef = useRef(0);
   // Every turn carries a token. Switching chats or starting a new one bumps it,
@@ -282,6 +348,13 @@ export default function AssistantView({
         if (!liveRef.current) return;
         bufRef.current += frag;
         setStream(bufRef.current);
+      }),
+    );
+    keep(
+      listen<string>("ai:reasoning", (frag) => {
+        if (!liveRef.current) return;
+        reasonRef.current += frag;
+        setReasoning(reasonRef.current);
       }),
     );
     keep(
@@ -334,7 +407,16 @@ export default function AssistantView({
     if (!el || !stickRef.current) return;
     el.scrollTop = el.scrollHeight;
     lastTopRef.current = el.scrollTop;
-  }, [messages, pending, thinking, stream, live, awaiting, editIndex]);
+  }, [
+    messages,
+    pending,
+    thinking,
+    stream,
+    reasoning,
+    live,
+    awaiting,
+    editIndex,
+  ]);
 
   useLayoutEffect(() => {
     const ta = taRef.current;
@@ -365,7 +447,9 @@ export default function AssistantView({
   // the streamed copy in the same commit, so the reply never renders twice.
   function startTurn(): Turn {
     bufRef.current = "";
+    reasonRef.current = "";
     setStream("");
+    setReasoning("");
     setLive([]);
     setAwaiting(false);
     setThinking(true);
@@ -384,7 +468,10 @@ export default function AssistantView({
     turnRef.current++;
     liveRef.current = false;
     bufRef.current = "";
+    reasonRef.current = "";
     setStream("");
+    setReasoning("");
+    setReasoned({});
     setLive([]);
     setAwaiting(false);
     setThinking(false);
@@ -396,7 +483,18 @@ export default function AssistantView({
     if (turn.token === turnRef.current) {
       liveRef.current = false;
       bufRef.current = "";
+      const thought = reasonRef.current;
+      reasonRef.current = "";
       setStream("");
+      setReasoning("");
+      // Hand the working to the group the resolved transcript put it in, so it
+      // stays reachable under the answer it produced.
+      if (thought) {
+        const key = [...groupMessages(r.messages)]
+          .reverse()
+          .find((g) => g.kind === "assistant")?.key;
+        if (key) setReasoned((prev) => ({ ...prev, [key]: thought }));
+      }
       setLive([]);
       setAwaiting(false);
       setMessages(r.messages);
@@ -525,7 +623,9 @@ export default function AssistantView({
       const msg = e instanceof Error ? e.message : String(e);
       liveRef.current = false;
       bufRef.current = "";
+      reasonRef.current = "";
       setStream("");
+      setReasoning("");
       setLive([]);
       setAwaiting(false);
       setNeedsKey(/no api key/i.test(msg));
@@ -587,7 +687,9 @@ export default function AssistantView({
       const msg = e instanceof Error ? e.message : String(e);
       liveRef.current = false;
       bufRef.current = "";
+      reasonRef.current = "";
       setStream("");
+      setReasoning("");
       setLive([]);
       setAwaiting(false);
       setNeedsKey(/no api key/i.test(msg));
@@ -615,7 +717,9 @@ export default function AssistantView({
       if (turn.token !== turnRef.current) return;
       liveRef.current = false;
       bufRef.current = "";
+      reasonRef.current = "";
       setStream("");
+      setReasoning("");
       setLive([]);
       setAwaiting(false);
       setError(e instanceof Error ? e.message : String(e));
@@ -745,7 +849,11 @@ export default function AssistantView({
 
                 {groups.map((g) =>
                   g.kind === "assistant" ? (
-                    <TurnGroup key={g.key} pieces={g.pieces} />
+                    <TurnGroup
+                      key={g.key}
+                      pieces={g.pieces}
+                      reasoning={reasoned[g.key]}
+                    />
                   ) : editIndex === g.index ? (
                     <div key={g.index} className="flex justify-end">
                       <div className="w-full max-w-[92%] rounded-lg border border-teal-line bg-teal-soft p-2.5 sm:max-w-[85%]">
@@ -821,9 +929,12 @@ export default function AssistantView({
                     pieces={live}
                     stream={stream}
                     waiting={awaiting}
+                    reasoning={reasoning}
+                    reasoningLive
                     pondering={
                       !stream &&
                       !awaiting &&
+                      !reasoning &&
                       live.every((p) => p.kind !== "tool" || p.done)
                     }
                   />

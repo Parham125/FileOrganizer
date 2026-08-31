@@ -1,5 +1,6 @@
 use fo_ai::organize::{self, Move};
-use fo_ai::OpenRouter;
+use fo_ai::{OpenRouter, ReasoningEffort};
+use fo_archive::ArchiveListing;
 use fo_chats::{derive_title, Chat, ChatSummary, Chats};
 use fo_dedup::{find_duplicates, find_similar_images, DupGroup, SimilarGroup};
 use fo_hasher::HashAlgo;
@@ -9,7 +10,7 @@ use fo_search::{ContentHit, ExtStat, Index, SearchHit, SearchOpts};
 use fo_trash::{SkippedItem, Trash, TrashItem};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
@@ -26,26 +27,124 @@ struct AppState {
 const KEYRING_SERVICE: &str = "com.parham.fileorganizer";
 const KEYRING_ACCOUNT: &str = "openrouter";
 
-fn set_key(key: &str) -> Result<(), String> {
+/// `settings.json` in the app data dir, filled in during setup. Non-secret
+/// preferences only; the API key lives in the keychain or `credentials.json`.
+static SETTINGS_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// `credentials.json` beside it, used only when key storage is set to "file".
+/// Kept separate from settings so it is obvious what the file holds.
+static CREDENTIALS_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where the API key is kept. The keychain is safe but, on an unsigned build,
+/// macOS re-prompts every launch; the file avoids prompts entirely at the cost
+/// of storing the key in cleartext (owner-only permissions, but cleartext).
+fn key_storage_is_file() -> bool {
+    SETTINGS_PATH
+        .get()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| v["key_storage"].as_str() == Some("file"))
+        .unwrap_or(false)
+}
+
+fn read_file_key() -> Option<String> {
+    let raw = fs::read_to_string(CREDENTIALS_PATH.get()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let key = v["openrouter"].as_str()?.to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+fn write_file_key(key: Option<&str>) -> Result<(), String> {
+    let path = CREDENTIALS_PATH
+        .get()
+        .ok_or_else(|| "credentials path unavailable".to_string())?;
+    match key {
+        None => match fs::remove_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        },
+        Some(k) => {
+            let body = serde_json::json!({ "openrouter": k }).to_string();
+            fs::write(path, body).map_err(|e| e.to_string())?;
+            // cleartext on disk is the tradeoff the user chose; at least keep
+            // it unreadable to other accounts on the machine
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The stored reasoning effort, falling back to the default when the file is
+/// missing, unreadable or malformed. Never fails a request over settings.
+fn reasoning_effort() -> ReasoningEffort {
+    SETTINGS_PATH
+        .get()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["reasoning_effort"].as_str()?.parse().ok())
+        .unwrap_or_default()
+}
+
+/// The key, held in memory after the first successful read. Every keychain read
+/// can raise an OS unlock prompt, and an unsigned build is re-prompted because
+/// macOS sees a new code identity each launch, so reading it once per launch
+/// instead of once per request is the difference between one prompt and one for
+/// every message. `None` means "not read yet", `Some(None)` means "no key set".
+static KEY_CACHE: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+fn set_keychain_key(key: &str) -> Result<(), String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| e.to_string())?
         .set_password(key)
         .map_err(|e| e.to_string())
 }
 
-fn get_key() -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .ok()?
-        .get_password()
-        .ok()
-}
-
-fn clear_key() -> Result<(), String> {
+fn clear_keychain_key() -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| e.to_string())?;
     match entry.delete_credential() {
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn set_key(key: &str) -> Result<(), String> {
+    if key_storage_is_file() {
+        write_file_key(Some(key))?;
+    } else {
+        set_keychain_key(key)?;
+    }
+    *KEY_CACHE.lock().unwrap() = Some(Some(key.to_string()));
+    Ok(())
+}
+
+fn get_key() -> Option<String> {
+    let mut cache = KEY_CACHE.lock().unwrap();
+    if let Some(cached) = cache.as_ref() {
+        return cached.clone();
+    }
+    let key = if key_storage_is_file() {
+        read_file_key()
+    } else {
+        keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+            .ok()
+            .and_then(|e| e.get_password().ok())
+    };
+    *cache = Some(key.clone());
+    key
+}
+
+fn clear_key() -> Result<(), String> {
+    // clear both stores, so removing the key never leaves a copy behind in the
+    // one that is not currently selected
+    let file = write_file_key(None);
+    let chain = clear_keychain_key();
+    *KEY_CACHE.lock().unwrap() = Some(None);
+    file.and(chain)
 }
 
 fn stat_entries(paths: &[PathBuf]) -> Vec<FileEntry> {
@@ -179,6 +278,13 @@ fn search_content(
         .lock()
         .unwrap()
         .search_content(&query, limit.unwrap_or(200))
+        .map_err(|e| e.to_string())
+}
+
+/// Read an archive's table of contents without extracting anything.
+#[tauri::command]
+fn list_archive(path: String, limit: Option<usize>) -> Result<ArchiveListing, String> {
+    fo_archive::list_archive(&PathBuf::from(path), limit.unwrap_or(200).clamp(1, 1000))
         .map_err(|e| e.to_string())
 }
 
@@ -536,6 +642,71 @@ fn clear_api_key() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_reasoning_effort() -> String {
+    reasoning_effort().as_effort().unwrap_or("off").to_string()
+}
+
+/// Merge one key into settings.json, so writing one preference never drops the
+/// others.
+fn write_setting(key: &str, value: serde_json::Value) -> Result<(), String> {
+    let path = SETTINGS_PATH
+        .get()
+        .ok_or_else(|| "Settings are not ready yet".to_string())?;
+    let mut doc = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !doc.is_object() {
+        doc = serde_json::json!({});
+    }
+    doc[key] = value;
+    fs::write(path, doc.to_string()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_reasoning_effort(effort: String) -> Result<(), String> {
+    let parsed: ReasoningEffort = effort.parse().map_err(|e: anyhow::Error| e.to_string())?;
+    write_setting("reasoning_effort", serde_json::json!(parsed))
+}
+
+#[tauri::command]
+fn get_key_storage() -> String {
+    if key_storage_is_file() {
+        "file".to_string()
+    } else {
+        "keychain".to_string()
+    }
+}
+
+/// Move the stored key to the other store and switch to it. Writing the key
+/// before clearing the old copy means a failure mid-switch leaves the key
+/// readable rather than lost.
+#[tauri::command]
+fn set_key_storage(storage: String) -> Result<(), String> {
+    let to_file = match storage.as_str() {
+        "file" => true,
+        "keychain" => false,
+        other => return Err(format!("unknown key storage \"{other}\"")),
+    };
+    if to_file == key_storage_is_file() {
+        return Ok(());
+    }
+    let existing = get_key();
+    write_setting("key_storage", serde_json::json!(storage))?;
+    if let Some(key) = existing {
+        if to_file {
+            write_file_key(Some(&key))?;
+            let _ = clear_keychain_key();
+        } else {
+            set_keychain_key(&key)?;
+            let _ = write_file_key(None);
+        }
+        *KEY_CACHE.lock().unwrap() = Some(Some(key));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn ai_propose_organization(
     root: String,
     model: String,
@@ -551,7 +722,7 @@ async fn ai_propose_organization(
             .map_err(|e| e.to_string())?
     };
     let _ = app.emit("ai:progress", format!("Analyzing {} files...", files.len()));
-    let client = OpenRouter::new(key, model);
+    let client = OpenRouter::new(key, model).with_reasoning(reasoning_effort());
     let _ = app.emit("ai:progress", "Building plan...");
     let plans = organize::propose_plan(&client, &root_path, &files)
         .await
@@ -595,7 +766,7 @@ fn ai_apply_organization(
 #[tauri::command]
 async fn ai_chat(prompt: String, model: String) -> Result<String, String> {
     let key = get_key().ok_or_else(|| "No API key set".to_string())?;
-    let client = OpenRouter::new(key, model);
+    let client = OpenRouter::new(key, model).with_reasoning(reasoning_effort());
     client.chat(None, &prompt).await.map_err(|e| e.to_string())
 }
 
@@ -735,6 +906,8 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             fs::create_dir_all(&dir)?;
+            let _ = SETTINGS_PATH.set(dir.join("settings.json"));
+            let _ = CREDENTIALS_PATH.set(dir.join("credentials.json"));
             let index = Index::open(&dir.join("index.db"))?;
             let trash = Trash::open(&dir)?;
             let rules = Rules::open(&dir)?;
@@ -756,6 +929,7 @@ pub fn run() {
             index_folder,
             index_content,
             search_content,
+            list_archive,
             start_watch,
             scan_duplicates,
             scan_similar_images,
@@ -778,6 +952,10 @@ pub fn run() {
             set_api_key,
             has_api_key,
             clear_api_key,
+            get_reasoning_effort,
+            set_reasoning_effort,
+            get_key_storage,
+            set_key_storage,
             ai_propose_organization,
             ai_apply_organization,
             ai_chat,

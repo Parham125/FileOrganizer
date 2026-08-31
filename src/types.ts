@@ -89,6 +89,9 @@ export type ViewId =
   | "settings";
 export type HashAlgo = "blake3" | "sha256";
 export type Theme = "light" | "dark" | "system";
+export type ReasoningEffort = "off" | "low" | "medium" | "high";
+// Where the OpenRouter key lives. Switching migrates it, it is never duplicated.
+export type KeyStorage = "keychain" | "file";
 
 // AI organizer
 export type Move = { from: string; to: string };
@@ -133,8 +136,8 @@ export type PendingAction = {
   args: Record<string, unknown>;
 };
 
-// Live turn events: "ai:delta" carries a bare text fragment, "ai:step" one of
-// these, "ai:done" nothing at all.
+// Live turn events: "ai:delta" and "ai:reasoning" each carry a bare text
+// fragment, "ai:step" one of these, "ai:done" nothing at all.
 export type AgentStep = {
   kind: "thinking" | "tool" | "tool_done" | "awaiting_approval";
   name?: string;

@@ -56,7 +56,11 @@ No signed build yet. [Build it from source](#develop) (one command), or open the
 
 🛟 **Safe by design.** Deletions go to an app-managed Trash with a full undo journal. Restore any file, undo the last change, or remove-forever when you are sure. Moves never overwrite, and the AI has no permanent-delete power at all.
 
-🔒 **Private.** Your files never leave your machine. The only network call is to your own AI provider, using your own key, stored in the OS keychain.
+🗜️ **Looks inside archives.** The assistant can list what is in a `.zip`, `.tar`, `.tar.gz` or `.7z` without extracting it, so you know what a big archive holds before deciding its fate. (RAR is not supported: every Rust binding ships bundled non-free C++.)
+
+🧠 **Reasoning, your call.** Reasoning effort is a setting (off, low, medium, high), so you decide how hard the model thinks against how many tokens it spends. Its thinking streams in, collapsed, under the answer.
+
+🔒 **Private.** Your files never leave your machine. The only network call is to your own AI provider, using your own key. Store the key in the OS keychain, or in the app's data folder if you would rather not be asked for your password on every launch.
 
 ---
 
@@ -136,9 +140,10 @@ Tagging a release (`git tag vX.Y.Z && git push origin vX.Y.Z`) triggers the GitH
 - [x] Windows NTFS MFT fast indexer (near-instant full-drive enumeration)
 - [x] Perceptual / near-duplicate matching for images
 - [x] Content search inside documents
+- [x] Storage insights, saved rules, chat history, streaming replies
 - [ ] USN Journal live sync on Windows
 - [ ] OCR for image and scanned-PDF text
-- [ ] Code-signed builds for Windows and macOS
+- [ ] RAR support (needs a non-bundled unrar binary)
 
 ---
 

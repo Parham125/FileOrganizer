@@ -1,6 +1,7 @@
 use crate::{stat_entries, AppState};
 use anyhow::{anyhow, Result};
 use fo_ai::OpenRouter;
+use fo_archive::list_archive;
 use fo_dedup::find_duplicates;
 use fo_hasher::HashAlgo;
 use fo_indexer::{FileSource, WalkdirSource};
@@ -115,6 +116,14 @@ fn tools() -> Value {
             "parameters": {"type": "object", "properties": {
                 "filter": rule_filter_schema()
             }, "required": ["filter"]}
+        }},
+        {"type": "function", "function": {
+            "name": "list_archive",
+            "description": "List what is inside a .zip/.tar/.tar.gz/.7z archive without extracting it. Returns each member's name, uncompressed size and whether it is a folder, plus the archive's total entry count and uncompressed size.",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "Absolute path to the archive file."},
+                "limit": {"type": "integer", "description": "Max entries to return (default 100, capped at 500). The reported entry_count is always the true total."}
+            }, "required": ["path"]}
         }},
         {"type": "function", "function": {
             "name": "trash_files",
@@ -348,6 +357,13 @@ fn execute_read_tool(name: &str, args: &Value, index: &Index, rules: &Rules) -> 
                 .collect();
             Ok(json!({"count": hits.len(), "sample": sample}))
         }
+        "list_archive" => {
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing path"))?;
+            let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
+            Ok(serde_json::to_value(list_archive(Path::new(path), limit)?)?)
+        }
         _ => Err(anyhow!("unknown read tool: {}", name)),
     }
 }
@@ -512,9 +528,16 @@ async fn run_loop(
     for _ in 0..MAX_STEPS {
         let _ = app.emit("ai:step", json!({"kind": "thinking"}));
         let msg = client
-            .chat_raw_stream(messages.clone(), Some(tools()), |delta| {
-                let _ = app.emit("ai:delta", delta);
-            })
+            .chat_raw_stream(
+                messages.clone(),
+                Some(tools()),
+                |delta| {
+                    let _ = app.emit("ai:delta", delta);
+                },
+                |reasoning| {
+                    let _ = app.emit("ai:reasoning", reasoning);
+                },
+            )
             .await?;
         push_message(&mut messages, msg.clone());
         let tool_calls: Vec<Value> = msg["tool_calls"].as_array().cloned().unwrap_or_default();
@@ -604,7 +627,7 @@ pub async fn ai_agent(
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
     let key = crate::get_key().ok_or_else(|| "No API key set".to_string())?;
-    let client = OpenRouter::new(key, model);
+    let client = OpenRouter::new(key, model).with_reasoning(crate::reasoning_effort());
     let mut messages = messages;
     if !starts_with_system(&messages) {
         if let Some(arr) = messages.as_array_mut() {
@@ -625,7 +648,7 @@ pub async fn ai_agent_continue(
     state: State<'_, AppState>,
 ) -> Result<AgentResult, String> {
     let key = crate::get_key().ok_or_else(|| "No API key set".to_string())?;
-    let client = OpenRouter::new(key, model);
+    let client = OpenRouter::new(key, model).with_reasoning(crate::reasoning_effort());
     let mut messages = messages;
     let approved = |id: &str| -> bool {
         approvals

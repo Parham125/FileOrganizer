@@ -6,9 +6,11 @@ import type {
   ContentHit,
   DupGroup,
   ExtStat,
+  KeyStorage,
   Move,
   PendingAction,
   Progress,
+  ReasoningEffort,
   Rule,
   RuleFilter,
   RuleRun,
@@ -521,6 +523,8 @@ function mockBridge(): Bridge {
   let contentIndexed = 0;
   let watching = false;
   let hasKey = true;
+  let effort: ReasoningEffort = "medium";
+  let keyStorage: KeyStorage = "keychain";
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
@@ -557,17 +561,25 @@ function mockBridge(): Bridge {
     });
   }
 
-  // Mirrors the desktop agent loop: a thinking beat, whatever the model says
-  // before it reaches for a tool, each read tool opening and closing, then the
-  // reply arriving a word at a time.
+  // Mirrors the desktop agent loop: a thinking beat, the reasoning the model
+  // works through when effort is on, whatever it says before it reaches for a
+  // tool, each read tool opening and closing, then the reply a word at a time.
   async function streamTurn(
     lead: string,
     tools: string[],
     text: string,
+    think = "",
   ): Promise<void> {
     const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
     emit("ai:step", { kind: "thinking" });
     await wait(200);
+    for (const frag of effort === "off" || !think
+      ? []
+      : think.split(/(?<=\s)/)) {
+      emit("ai:reasoning", frag);
+      await wait(10);
+    }
+    if (think) await wait(200);
     for (const frag of lead ? lead.split(/(?<=\s)/) : []) {
       emit("ai:delta", frag);
       await wait(14);
@@ -839,6 +851,25 @@ function mockBridge(): Bridge {
       case "clear_api_key":
         hasKey = false;
         return undefined as T;
+      case "get_key_storage":
+        return keyStorage as T;
+      case "set_key_storage": {
+        const next = String(args.storage ?? "");
+        if (next !== "keychain" && next !== "file")
+          throw new Error(`Unknown key storage: ${next}`);
+        await new Promise((r) => setTimeout(r, 220));
+        keyStorage = next;
+        return undefined as T;
+      }
+      case "get_reasoning_effort":
+        return effort as T;
+      case "set_reasoning_effort": {
+        const next = String(args.effort ?? "");
+        if (!["off", "low", "medium", "high"].includes(next))
+          throw new Error(`Unknown reasoning effort: ${next}`);
+        effort = next as ReasoningEffort;
+        return undefined as T;
+      }
       case "ai_propose_organization": {
         if (!hasKey) throw new Error("No API key set");
         await rampText(
@@ -885,7 +916,12 @@ function mockBridge(): Bridge {
             "Trash is reversible here, so anything you change your mind about comes back from the Trash view.",
           ].join("\n");
           const lead = "Hashing everything under `~/Downloads` first.";
-          await streamTurn(lead, ["find_duplicates"], reply);
+          await streamTurn(
+            lead,
+            ["find_duplicates"],
+            reply,
+            "Name matches are not enough to call two files duplicates, so I want content hashes before I claim anything. Run find_duplicates over Downloads, then keep the copy in the folder that looks deliberate (Documents, Pictures) and offer the Downloads copy for Trash. Trashing is journalled and reversible, so staging it for approval is safe as long as I never touch the copy being kept.",
+          );
           emit("ai:step", { kind: "awaiting_approval" });
           emit("ai:done", undefined);
           const messages: ChatMessage[] = [
@@ -932,7 +968,12 @@ function mockBridge(): Bridge {
           "Say the word and I will stage the safe ones for Trash.",
         ].join("\n");
         const lead = "Let me check the index and the biggest files first.";
-        await streamTurn(lead, ["index_stats", "search_files"], reply);
+        await streamTurn(
+          lead,
+          ["index_stats", "search_files"],
+          reply,
+          "Walking the whole tree would be slow and I already have an index, so index_stats for the totals and then search_files with a size floor around 100 MB. Downloads is usually the heaviest folder but I should confirm that from the numbers rather than assume it. Size alone is not a reason to delete something, so pair it with last-opened dates and let the user decide.",
+        );
         emit("ai:done", undefined);
         const messages: ChatMessage[] = [
           ...incoming,
@@ -965,7 +1006,12 @@ function mockBridge(): Bridge {
         else
           final_text =
             "No problem, I left everything where it is. Nothing was changed.";
-        await streamTurn("", approved > 0 ? ["trash_files"] : [], final_text);
+        await streamTurn(
+          "",
+          approved > 0 ? ["trash_files"] : [],
+          final_text,
+          "Only the approved paths go through. The skipped ones stay exactly where they are, and I should say so plainly instead of glossing over them.",
+        );
         emit("ai:done", undefined);
         const messages: ChatMessage[] = [...incoming];
         if (approved > 0) {
