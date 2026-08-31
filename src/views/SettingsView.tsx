@@ -3,8 +3,15 @@ import { invoke } from "../bridge";
 import ModelSelector from "../ModelSelector";
 import PageHeader from "../components/PageHeader";
 import Segmented from "../components/Segmented";
-import { IconCheck, IconKey } from "../components/icons";
-import type { HashAlgo, KeyStorage, ReasoningEffort, Theme } from "../types";
+import { IconCheck, IconKey, IconReveal } from "../components/icons";
+import { formatSize } from "../format";
+import type {
+  AppDataSummary,
+  HashAlgo,
+  KeyStorage,
+  ReasoningEffort,
+  Theme,
+} from "../types";
 
 // The behaviour behind each store, in the user's terms. The keychain line names
 // the one thing that actually annoys people about it rather than burying it.
@@ -41,7 +48,10 @@ function Row({
   );
 }
 
-function ApiKeyControl() {
+// reload counts resets done in the Stored data row below. A reset takes the key
+// with it, so the saved indicator is read back from the runtime rather than left
+// claiming a key that no longer exists.
+function ApiKeyControl({ reload }: { reload: number }) {
   const [saved, setSaved] = useState<boolean | null>(null);
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
@@ -57,7 +67,7 @@ function ApiKeyControl() {
     invoke<KeyStorage>("get_key_storage")
       .then(setStorage)
       .catch(() => setStorage("keychain"));
-  }, []);
+  }, [reload]);
 
   // Switching moves the key rather than copying it, so the saved indicator is
   // read back from the runtime once the move lands instead of being assumed.
@@ -191,6 +201,165 @@ function ApiKeyControl() {
   );
 }
 
+// The folder name at the end is what identifies this path, so a long one loses
+// the middle folders rather than its tail. The full path stays in the title
+// attribute. Windows paths split on their own separator.
+function shortPath(path: string, max = 40): string {
+  if (path.length <= max) return path;
+  const sep = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(sep);
+  if (parts.length > 4) {
+    const short = [...parts.slice(0, 3), "…", parts[parts.length - 1]].join(
+      sep,
+    );
+    if (short.length < path.length) return short;
+  }
+  return path.slice(0, 10) + "…" + path.slice(-(max - 11));
+}
+
+function StoredDataControl({ onReset }: { onReset: () => void }) {
+  const [summary, setSummary] = useState<AppDataSummary | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState("");
+
+  async function load() {
+    try {
+      setSummary(await invoke<AppDataSummary>("app_data_summary"));
+      setLoadError("");
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  // The runtime refuses a reset while its Trash still holds real files. The same
+  // count drives the note and the disabled button, so the user reads the reason
+  // before they reach for the action instead of after it fails.
+  const trashed = summary?.trashed_files ?? 0;
+  const blocked = trashed > 0;
+  const blockedReason = `${trashed} ${trashed === 1 ? "file is" : "files are"} still in the app's Trash. Restore or empty it first.`;
+
+  async function reveal() {
+    if (!summary) return;
+    setError("");
+    try {
+      await invoke("reveal_file", { path: summary.dir });
+    } catch (e) {
+      setError(
+        `Could not open the folder: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  async function reset() {
+    setBusy(true);
+    setError("");
+    setDone("");
+    try {
+      await invoke("reset_app_data");
+      setDone("Stored data deleted, including your saved API key.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      await load();
+      onReset();
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="w-full max-w-sm sm:w-80">
+      <div className="rounded-md border border-line bg-surface-2 px-3 py-2.5">
+        <div
+          className="truncate font-mono text-xs text-ink"
+          title={summary?.dir ?? undefined}
+        >
+          {summary
+            ? shortPath(summary.dir)
+            : loadError
+              ? "Folder could not be read"
+              : "Reading folder"}
+        </div>
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <span className="font-mono text-xs tabular-nums text-ink-soft">
+            {summary ? `${formatSize(summary.bytes)} on disk` : "Checking size"}
+          </span>
+          <button
+            type="button"
+            onClick={reveal}
+            disabled={!summary}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-line bg-surface px-2.5 py-1 text-xs font-medium text-ink hover:border-line-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+          >
+            <IconReveal className="h-3.5 w-3.5" />
+            Open folder
+          </button>
+        </div>
+      </div>
+      {blocked && (
+        <p className="mt-2.5 border-l-2 border-ochre pl-2.5 text-sm text-ochre">
+          {blockedReason} Deleting now would take them with it.
+        </p>
+      )}
+      {confirming ? (
+        <div className="mt-3">
+          <p className="text-xs text-ink-soft">
+            Delete everything the app has stored? This cannot be undone.
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirming(false)}
+              className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+            >
+              Keep
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirming(false);
+                void reset();
+              }}
+              disabled={busy}
+              className="rounded-md bg-brick px-2.5 py-1.5 text-xs font-medium text-white hover:brightness-95 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => {
+            setDone("");
+            setError("");
+            setConfirming(true);
+          }}
+          disabled={blocked || busy || !summary}
+          title={blocked ? blockedReason : undefined}
+          className="mt-3 rounded-md border border-brick/50 px-2.5 py-1.5 text-xs font-medium text-brick hover:bg-brick-soft disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick"
+        >
+          {busy ? "Deleting" : "Delete stored data"}
+        </button>
+      )}
+      {done && <p className="mt-2 text-xs text-teal">{done}</p>}
+      {error && (
+        <p className="mt-2 text-xs text-brick">Nothing was deleted: {error}</p>
+      )}
+      {loadError && !error && (
+        <p className="mt-2 text-xs text-brick">
+          The folder could not be read: {loadError}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsView({
   model,
   onModel,
@@ -208,12 +377,13 @@ export default function SettingsView({
 }) {
   const [effort, setEffort] = useState<ReasoningEffort | null>(null);
   const [effortError, setEffortError] = useState("");
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     invoke<ReasoningEffort>("get_reasoning_effort")
       .then(setEffort)
       .catch(() => setEffort("medium"));
-  }, []);
+  }, [reload]);
 
   async function changeEffort(next: ReasoningEffort) {
     const prev = effort;
@@ -271,7 +441,7 @@ export default function SettingsView({
           title="OpenRouter API key"
           desc="Powers Organize and Assistant. Sent only to OpenRouter, never shown back to you, and it never leaves this device otherwise."
         >
-          <ApiKeyControl />
+          <ApiKeyControl reload={reload} />
         </Row>
 
         <Row
@@ -303,6 +473,14 @@ export default function SettingsView({
               </p>
             )}
           </div>
+        </Row>
+
+        <Row
+          top
+          title="Stored data"
+          desc="The app keeps its index, chat history, rules and settings in a folder on this device. Deleting it leaves your own files alone."
+        >
+          <StoredDataControl onReset={() => setReload((n) => n + 1)} />
         </Row>
       </div>
     </div>

@@ -669,6 +669,72 @@ fn set_reasoning_effort(effort: String) -> Result<(), String> {
     write_setting("reasoning_effort", serde_json::json!(parsed))
 }
 
+/// What the app is holding on disk, so it can be found and removed by hand.
+/// macOS has no uninstaller, so this is the only way to see it from inside.
+#[derive(serde::Serialize)]
+struct AppDataSummary {
+    dir: String,
+    bytes: u64,
+    trashed_files: i64,
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        total = total.saturating_add(if meta.is_dir() {
+            dir_size(&entry.path())
+        } else {
+            meta.len()
+        });
+    }
+    total
+}
+
+#[tauri::command]
+fn app_data_summary(app: AppHandle, state: State<AppState>) -> Result<AppDataSummary, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let trashed_files = state
+        .trash
+        .lock()
+        .unwrap()
+        .list(None, 100_000)
+        .map(|items| items.iter().filter(|i| !i.restored).count() as i64)
+        .unwrap_or(0);
+    Ok(AppDataSummary {
+        bytes: dir_size(&dir),
+        dir: dir.to_string_lossy().to_string(),
+        trashed_files,
+    })
+}
+
+/// Delete everything the app stores. Refuses while files are still quarantined,
+/// because those are the user's files and this would destroy them; they have to
+/// restore or empty the Trash first, which is a deliberate act either way.
+#[tauri::command]
+fn reset_app_data(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let pending = state
+        .trash
+        .lock()
+        .unwrap()
+        .list(None, 100_000)
+        .map(|items| items.iter().filter(|i| !i.restored).count())
+        .unwrap_or(0);
+    if pending > 0 {
+        return Err(format!(
+            "{pending} file(s) are still in the app's Trash. Restore them or empty the Trash first, so this cannot delete them by accident."
+        ));
+    }
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let _ = clear_key();
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn get_key_storage() -> String {
     if key_storage_is_file() {
@@ -955,6 +1021,8 @@ pub fn run() {
             get_reasoning_effort,
             set_reasoning_effort,
             get_key_storage,
+            app_data_summary,
+            reset_app_data,
             set_key_storage,
             ai_propose_organization,
             ai_apply_organization,

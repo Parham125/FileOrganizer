@@ -41,6 +41,14 @@ export type StorageStats = {
   by_ext: ExtStat[];
 };
 
+// Everything the app keeps on this device. trashed_files counts the files still
+// sitting in the app's own Trash, which is what blocks a reset.
+export type AppDataSummary = {
+  dir: string;
+  bytes: number;
+  trashed_files: number;
+};
+
 export type TrashItem = {
   id: string;
   op_id: string;

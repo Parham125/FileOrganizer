@@ -1,5 +1,6 @@
 import type {
   AgentResult,
+  AppDataSummary,
   Chat,
   ChatMessage,
   ChatSummary,
@@ -525,6 +526,9 @@ function mockBridge(): Bridge {
   let hasKey = true;
   let effort: ReasoningEffort = "medium";
   let keyStorage: KeyStorage = "keychain";
+  const appDataDir =
+    "/Users/you/Library/Application Support/com.parham.fileorganizer";
+  let appDataBytes = 50_412_000;
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
@@ -851,6 +855,30 @@ function mockBridge(): Bridge {
       case "clear_api_key":
         hasKey = false;
         return undefined as T;
+      case "app_data_summary":
+        return {
+          dir: appDataDir,
+          bytes: appDataBytes,
+          trashed_files: trash.filter((t) => !t.restored).length,
+        } as AppDataSummary as T;
+      case "reset_app_data": {
+        const pending = trash.filter((t) => !t.restored).length;
+        if (pending > 0)
+          throw new Error(
+            `${pending} file(s) are still in the app's Trash. Restore them or empty the Trash first, so this cannot delete them by accident.`,
+          );
+        chats.length = 0;
+        rules.length = 0;
+        trash.length = 0;
+        opOrder.length = 0;
+        undoable.clear();
+        hasKey = false;
+        effort = "medium";
+        keyStorage = "keychain";
+        appDataBytes = 12_288;
+        emit("index:changed", undefined);
+        return undefined as T;
+      }
       case "get_key_storage":
         return keyStorage as T;
       case "set_key_storage": {
