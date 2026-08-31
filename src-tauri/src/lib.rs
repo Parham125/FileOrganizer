@@ -6,7 +6,7 @@ use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
 use fo_rules::{match_rule, Rule, RuleAction, RuleFilter, Rules};
 use fo_search::{ContentHit, ExtStat, Index, SearchHit, SearchOpts};
-use fo_trash::{Trash, TrashItem};
+use fo_trash::{SkippedItem, Trash, TrashItem};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -303,6 +303,26 @@ fn list_trash(limit: Option<i64>, state: State<AppState>) -> Result<Vec<TrashIte
 
 /// Restore/undo returns (target now holding the file, previous stored path).
 /// Keep the index correct: drop the now-empty stored path, upsert the target.
+/// Point the index at where a batch of moved items now live. A moved folder
+/// repoints every indexed path beneath it; a moved file is re-stated.
+fn reindex_after_move(idx: &mut Index, items: &[TrashItem]) {
+    let mut upsert = Vec::new();
+    for it in items {
+        let from = PathBuf::from(&it.original_path);
+        let to = PathBuf::from(&it.stored_path);
+        let _ = idx.remove_path(&from);
+        if it.is_dir {
+            let _ = idx.reparent(&from, &to);
+        } else {
+            upsert.push(to);
+        }
+    }
+    let entries = stat_entries(&upsert);
+    if !entries.is_empty() {
+        let _ = idx.upsert_batch(&entries);
+    }
+}
+
 fn reindex_moved(state: &State<AppState>, restored: &[(PathBuf, PathBuf)]) {
     let mut idx = state.index.lock().unwrap();
     for (_, stored) in restored {
@@ -361,6 +381,16 @@ const RULE_RUN_LIMIT: i64 = 50_000;
 struct RuleRun {
     op_id: String,
     count: usize,
+    skipped: Vec<SkippedItem>,
+}
+
+/// Result of applying an AI organize proposal. `skipped` names every move that
+/// did not happen and why, so the UI never reports a silent partial success.
+#[derive(serde::Serialize)]
+struct ApplyOrganization {
+    op_id: String,
+    moved: usize,
+    skipped: Vec<SkippedItem>,
 }
 
 #[tauri::command]
@@ -444,6 +474,7 @@ fn run_rule(id: String, state: State<AppState>) -> Result<RuleRun, String> {
         return Ok(RuleRun {
             op_id: String::new(),
             count: 0,
+            skipped: Vec::new(),
         });
     }
     let op = match &rule.action {
@@ -467,18 +498,11 @@ fn run_rule(id: String, state: State<AppState>) -> Result<RuleRun, String> {
     };
     {
         let mut idx = state.index.lock().unwrap();
-        for it in &op.items {
-            let _ = idx.remove_path(&PathBuf::from(&it.original_path));
-        }
         if matches!(rule.action, RuleAction::MoveTo { .. }) {
-            let moved: Vec<PathBuf> = op
-                .items
-                .iter()
-                .map(|i| PathBuf::from(&i.stored_path))
-                .collect();
-            let entries = stat_entries(&moved);
-            if !entries.is_empty() {
-                let _ = idx.upsert_batch(&entries);
+            reindex_after_move(&mut idx, &op.items);
+        } else {
+            for it in &op.items {
+                let _ = idx.remove_path(&PathBuf::from(&it.original_path));
             }
         }
     }
@@ -492,6 +516,7 @@ fn run_rule(id: String, state: State<AppState>) -> Result<RuleRun, String> {
     Ok(RuleRun {
         op_id: op.id,
         count,
+        skipped: op.skipped,
     })
 }
 
@@ -544,7 +569,10 @@ async fn ai_propose_organization(
 }
 
 #[tauri::command]
-fn ai_apply_organization(moves: Vec<Move>, state: State<AppState>) -> Result<String, String> {
+fn ai_apply_organization(
+    moves: Vec<Move>,
+    state: State<AppState>,
+) -> Result<ApplyOrganization, String> {
     let pairs: Vec<(PathBuf, PathBuf)> = moves
         .iter()
         .map(|m| (m.from.clone(), m.to.clone()))
@@ -556,19 +584,12 @@ fn ai_apply_organization(moves: Vec<Move>, state: State<AppState>) -> Result<Str
             .map_err(|e| e.to_string())?
     };
     let mut idx = state.index.lock().unwrap();
-    for it in &op.items {
-        let _ = idx.remove_path(&PathBuf::from(&it.original_path));
-    }
-    let new_paths: Vec<PathBuf> = op
-        .items
-        .iter()
-        .map(|i| PathBuf::from(&i.stored_path))
-        .collect();
-    let entries = stat_entries(&new_paths);
-    if !entries.is_empty() {
-        let _ = idx.upsert_batch(&entries);
-    }
-    Ok(op.id)
+    reindex_after_move(&mut idx, &op.items);
+    Ok(ApplyOrganization {
+        op_id: op.id,
+        moved: op.items.len(),
+        skipped: op.skipped,
+    })
 }
 
 #[tauri::command]

@@ -13,8 +13,10 @@ import Markdown from "../components/Markdown";
 import ChatHistory from "../components/ChatHistory";
 import {
   IconAssistant,
+  IconBranch,
   IconCheck,
   IconHistory,
+  IconPencil,
   IconSend,
   IconSpark,
 } from "../components/icons";
@@ -38,7 +40,46 @@ const TOOL_LABELS: Record<string, string> = {
   move_files: "Moved files",
 };
 
-type LiveStep = { id: string; name: string; done: boolean };
+// One assistant turn is a run of pieces: what it said, what it reached for, what
+// it said next. Tool results stay out of the view, they are bookkeeping.
+type Piece =
+  | { kind: "prose"; text: string }
+  | { kind: "tool"; id: string; name: string; done: boolean };
+
+type Group =
+  | { kind: "user"; index: number; text: string }
+  | { kind: "assistant"; key: string; pieces: Piece[] };
+
+// Consecutive assistant and tool messages collapse into one turn, in the order
+// the model produced them, so prose written before a tool call keeps its place.
+function groupMessages(messages: ChatMessage[]): Group[] {
+  const out: Group[] = [];
+  messages.forEach((m, i) => {
+    if (m.role === "user") {
+      if (m.content)
+        out.push({ kind: "user", index: i, text: String(m.content) });
+      return;
+    }
+    if (m.role !== "assistant") return;
+    if (!m.content && !m.tool_calls?.length) return;
+    const last = out[out.length - 1];
+    let group: Group;
+    if (last && last.kind === "assistant") group = last;
+    else
+      out.push((group = { kind: "assistant", key: `turn-${i}`, pieces: [] }));
+    if (group.kind !== "assistant") return;
+    if (m.content)
+      group.pieces.push({ kind: "prose", text: String(m.content) });
+    for (const tc of m.tool_calls ?? [])
+      group.pieces.push({
+        kind: "tool",
+        id: tc.id,
+        name: tc.function.name,
+        done: true,
+      });
+  });
+  return out;
+}
 
 // A turn is stamped with the chat it began in, so its result is saved there
 // even when the reader has moved on to another chat by the time it lands.
@@ -65,21 +106,119 @@ function actionPaths(p: PendingAction): string[] {
   return [];
 }
 
-function ActivityNote({ label, live }: { label: string; live?: boolean }) {
+// On a threaded turn the marker sits on the rail itself, so tool activity reads
+// as a step along the same thread rather than a separate speaker.
+function ActivityNote({
+  label,
+  live,
+  rail,
+}: {
+  label: string;
+  live?: boolean;
+  rail?: boolean;
+}) {
   return (
     <div
       className={
-        "flex items-center gap-2 px-1 text-xs " +
+        "relative flex items-center gap-2 text-xs " +
+        (rail ? "" : "px-1 ") +
         (live ? "text-ink-soft" : "text-ink-faint")
       }
     >
       <span
+        aria-hidden="true"
         className={
           "h-1.5 w-1.5 shrink-0 " +
-          (live ? "bg-teal fo-pulse" : "border border-ink-faint bg-transparent")
+          (rail ? "absolute -left-[17px] " : "") +
+          (live
+            ? "bg-teal fo-pulse"
+            : "border border-ink-faint " +
+              (rail ? "bg-surface" : "bg-transparent"))
         }
       />
       {label}
+    </div>
+  );
+}
+
+function Bubble({
+  text,
+  tail,
+  streaming,
+}: {
+  text: string;
+  tail: boolean;
+  streaming?: boolean;
+}) {
+  return (
+    <div className="flex justify-start">
+      <div
+        className={
+          "min-w-0 max-w-[92%] rounded-lg border border-line bg-surface-2 px-3.5 py-2.5 sm:max-w-[85%] " +
+          (tail ? "rounded-bl-sm " : "") +
+          (streaming ? "fo-streaming" : "")
+        }
+      >
+        <Markdown text={text} />
+      </div>
+    </div>
+  );
+}
+
+// One assistant turn. When it has more than one piece a rail runs down its left
+// edge, so the whole run reads as a single continuous answer.
+function TurnGroup({
+  pieces,
+  stream,
+  waiting,
+  pondering,
+}: {
+  pieces: Piece[];
+  stream?: string;
+  waiting?: boolean;
+  pondering?: boolean;
+}) {
+  const extras = (stream ? 1 : 0) + (waiting ? 1 : 0) + (pondering ? 1 : 0);
+  const rail = pieces.length + extras > 1;
+  const last = extras === 0 ? pieces.length - 1 : -1;
+  return (
+    <div
+      className={
+        "flex flex-col gap-2 " +
+        (rail ? "border-l border-teal-line pl-3.5" : "")
+      }
+    >
+      {pieces.map((p, i) =>
+        p.kind === "prose" ? (
+          <Bubble key={`p${i}`} text={p.text} tail={i === last} />
+        ) : (
+          <ActivityNote
+            key={p.id}
+            rail={rail}
+            live={!p.done}
+            label={
+              p.done
+                ? (TOOL_LABELS[p.name] ?? "Used a tool")
+                : (TOOL_RUNNING[p.name] ?? "Working")
+            }
+          />
+        ),
+      )}
+      {waiting && (
+        <ActivityNote live rail={rail} label="Waiting on your go-ahead" />
+      )}
+      {stream ? <Bubble streaming text={stream} tail={false} /> : null}
+      {pondering && (
+        <div
+          className={
+            "flex items-center gap-2 text-sm text-ink-soft " +
+            (rail ? "" : "px-1")
+          }
+        >
+          <span className="h-3.5 w-3.5 rounded-full border-2 border-teal/30 border-t-teal fo-spin" />
+          Thinking
+        </div>
+      )}
     </div>
   );
 }
@@ -100,8 +239,13 @@ export default function AssistantView({
   const [error, setError] = useState("");
   const [needsKey, setNeedsKey] = useState(false);
   const [stream, setStream] = useState("");
-  const [steps, setSteps] = useState<LiveStep[]>([]);
+  const [live, setLive] = useState<Piece[]>([]);
   const [awaiting, setAwaiting] = useState(false);
+  const [editIndex, setEditIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [forking, setForking] = useState(false);
+  const [forkedFrom, setForkedFrom] = useState("");
+  const [branched, setBranched] = useState<string[]>([]);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [chatId, setChatId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -114,6 +258,9 @@ export default function AssistantView({
   // Only a turn we started listens to the event stream, and autoscroll lets go
   // the moment the reader scrolls up to read something further back.
   const liveRef = useRef(false);
+  // The text arriving right now. It is committed into the turn as its own piece
+  // the moment the model reaches for a tool, so live and saved turns look alike.
+  const bufRef = useRef("");
   const stickRef = useRef(true);
   const lastTopRef = useRef(0);
   // Every turn carries a token. Switching chats or starting a new one bumps it,
@@ -132,7 +279,9 @@ export default function AssistantView({
       void p.then((off) => (dropped ? off() : offs.push(off)));
     keep(
       listen<string>("ai:delta", (frag) => {
-        if (liveRef.current) setStream((s) => s + frag);
+        if (!liveRef.current) return;
+        bufRef.current += frag;
+        setStream(bufRef.current);
       }),
     );
     keep(
@@ -140,17 +289,25 @@ export default function AssistantView({
         if (!liveRef.current) return;
         if (step.kind === "tool" && step.name) {
           const name = step.name;
-          setSteps((prev) => [
+          const said = bufRef.current;
+          bufRef.current = "";
+          if (said) setStream("");
+          setLive((prev) => [
             ...prev,
-            { id: `${name}-${prev.length}`, name, done: false },
+            ...(said
+              ? [{ kind: "prose", text: said } as Piece]
+              : ([] as Piece[])),
+            { kind: "tool", id: `${name}-${prev.length}`, name, done: false },
           ]);
         } else if (step.kind === "tool_done" && step.name) {
           const name = step.name;
-          setSteps((prev) => {
-            const i = prev.findIndex((s) => s.name === name && !s.done);
+          setLive((prev) => {
+            const i = prev.findIndex(
+              (s) => s.kind === "tool" && s.name === name && !s.done,
+            );
             if (i < 0) return prev;
             const next = [...prev];
-            next[i] = { ...next[i], done: true };
+            next[i] = { ...(next[i] as Piece & { kind: "tool" }), done: true };
             return next;
           });
         } else if (step.kind === "awaiting_approval") {
@@ -161,7 +318,9 @@ export default function AssistantView({
     keep(
       listen("ai:done", () => {
         if (liveRef.current)
-          setSteps((prev) => prev.map((s) => ({ ...s, done: true })));
+          setLive((prev) =>
+            prev.map((s) => (s.kind === "tool" ? { ...s, done: true } : s)),
+          );
       }),
     );
     return () => {
@@ -175,7 +334,7 @@ export default function AssistantView({
     if (!el || !stickRef.current) return;
     el.scrollTop = el.scrollHeight;
     lastTopRef.current = el.scrollTop;
-  }, [messages, pending, thinking, stream, steps, awaiting]);
+  }, [messages, pending, thinking, stream, live, awaiting, editIndex]);
 
   useLayoutEffect(() => {
     const ta = taRef.current;
@@ -205,13 +364,15 @@ export default function AssistantView({
   // Every turn starts from an empty buffer, and the resolved transcript replaces
   // the streamed copy in the same commit, so the reply never renders twice.
   function startTurn(): Turn {
+    bufRef.current = "";
     setStream("");
-    setSteps([]);
+    setLive([]);
     setAwaiting(false);
     setThinking(true);
     setError("");
     setSaveError("");
     setPending([]);
+    setEditIndex(null);
     stickRef.current = true;
     liveRef.current = true;
     return { token: ++turnRef.current, chat: chatIdRef.current };
@@ -222,8 +383,9 @@ export default function AssistantView({
   function abandonTurn() {
     turnRef.current++;
     liveRef.current = false;
+    bufRef.current = "";
     setStream("");
-    setSteps([]);
+    setLive([]);
     setAwaiting(false);
     setThinking(false);
   }
@@ -233,8 +395,9 @@ export default function AssistantView({
   function endTurn(r: AgentResult, turn: Turn) {
     if (turn.token === turnRef.current) {
       liveRef.current = false;
+      bufRef.current = "";
       setStream("");
-      setSteps([]);
+      setLive([]);
       setAwaiting(false);
       setMessages(r.messages);
       setPending(r.pending);
@@ -292,6 +455,8 @@ export default function AssistantView({
       setSaveError("");
       setChatsError("");
       setInput("");
+      setEditIndex(null);
+      setForkedFrom("");
       stickRef.current = true;
       if (window.matchMedia("(max-width: 639px)").matches)
         setHistoryOpen(false);
@@ -359,8 +524,71 @@ export default function AssistantView({
       if (turn.token !== turnRef.current) return;
       const msg = e instanceof Error ? e.message : String(e);
       liveRef.current = false;
+      bufRef.current = "";
       setStream("");
-      setSteps([]);
+      setLive([]);
+      setAwaiting(false);
+      setNeedsKey(/no api key/i.test(msg));
+      setError(msg);
+    } finally {
+      if (turn.token === turnRef.current) setThinking(false);
+    }
+  }
+
+  // Editing a past message never rewrites the chat it came from. The transcript
+  // up to that point plus the new wording is saved as its own chat, the view
+  // moves there, and the turn runs in the copy.
+  async function fork(index: number, text: string) {
+    const content = text.trim();
+    if (!content || thinking || forking) return;
+    const forked: ChatMessage[] = [
+      ...messages.slice(0, index),
+      { role: "user", content },
+    ];
+    const origin = chats.find((c) => c.id === chatIdRef.current)?.title ?? "";
+    abandonTurn();
+    const guard = turnRef.current;
+    setForking(true);
+    setSaveError("");
+    let saved: Chat;
+    try {
+      saved = await invoke<Chat>("save_chat", { id: null, messages: forked });
+    } catch (e) {
+      setForking(false);
+      setSaveError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    // The reader may have opened another chat while the copy was being written.
+    if (guard !== turnRef.current) {
+      setForking(false);
+      void refreshChats();
+      return;
+    }
+    chatIdRef.current = saved.id;
+    setChatId(saved.id);
+    setMessages(forked);
+    setBranched((prev) => [...prev, saved.id]);
+    setForkedFrom(origin);
+    setApprovals({});
+    setDone(true);
+    setNeedsKey(false);
+    setChatsError("");
+    void refreshChats();
+    const turn = startTurn();
+    setForking(false);
+    try {
+      const r = await invoke<AgentResult>("ai_agent", {
+        messages: forked,
+        model,
+      });
+      endTurn(r, turn);
+    } catch (e) {
+      if (turn.token !== turnRef.current) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      liveRef.current = false;
+      bufRef.current = "";
+      setStream("");
+      setLive([]);
       setAwaiting(false);
       setNeedsKey(/no api key/i.test(msg));
       setError(msg);
@@ -386,8 +614,9 @@ export default function AssistantView({
     } catch (e) {
       if (turn.token !== turnRef.current) return;
       liveRef.current = false;
+      bufRef.current = "";
       setStream("");
-      setSteps([]);
+      setLive([]);
       setAwaiting(false);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -407,9 +636,12 @@ export default function AssistantView({
     setNeedsKey(false);
     setSaveError("");
     setInput("");
+    setEditIndex(null);
+    setForkedFrom("");
   }
 
   const approvedCount = pending.filter((p) => approvals[p.id] !== false).length;
+  const groups = groupMessages(messages);
 
   return (
     <div className="space-y-6">
@@ -450,6 +682,7 @@ export default function AssistantView({
           <ChatHistory
             chats={chats}
             currentId={chatId}
+            branched={branched}
             loading={chatsLoading}
             loadingId={loadingId}
             error={chatsError}
@@ -500,71 +733,100 @@ export default function AssistantView({
               </div>
             ) : (
               <>
-                {messages.map((m, i) => {
-                  if (m.role === "user")
-                    return (
-                      <div key={i} className="flex justify-end">
-                        <div className="max-w-[80%] whitespace-pre-wrap rounded-lg rounded-br-sm bg-teal px-3.5 py-2.5 text-sm text-white">
-                          {m.content}
+                {forkedFrom && (
+                  <div className="flex items-start gap-2 border-l border-teal-line pl-3.5 text-xs text-ink-soft">
+                    <IconBranch className="mt-px h-3.5 w-3.5 shrink-0 text-ink-faint" />
+                    <span>
+                      Branched from &ldquo;{forkedFrom}&rdquo;. That chat still
+                      has your original message.
+                    </span>
+                  </div>
+                )}
+
+                {groups.map((g) =>
+                  g.kind === "assistant" ? (
+                    <TurnGroup key={g.key} pieces={g.pieces} />
+                  ) : editIndex === g.index ? (
+                    <div key={g.index} className="flex justify-end">
+                      <div className="w-full max-w-[92%] rounded-lg border border-teal-line bg-teal-soft p-2.5 sm:max-w-[85%]">
+                        <textarea
+                          autoFocus
+                          rows={3}
+                          value={editDraft}
+                          onChange={(e) => setEditDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape") setEditIndex(null);
+                            else if (
+                              e.key === "Enter" &&
+                              (e.metaKey || e.ctrlKey)
+                            )
+                              void fork(g.index, editDraft);
+                          }}
+                          aria-label="Edit this message"
+                          className="w-full resize-y rounded-md border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-teal focus:ring-2 focus:ring-teal/30"
+                        />
+                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                          <p className="min-w-0 text-xs text-ink-soft">
+                            Runs in a new chat. This one stays as it is.
+                          </p>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setEditIndex(null)}
+                              className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void fork(g.index, editDraft)}
+                              disabled={!editDraft.trim() || forking}
+                              className="inline-flex items-center gap-1.5 rounded-md bg-teal px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:brightness-95 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                            >
+                              <IconBranch className="h-3.5 w-3.5" />
+                              {forking ? "Starting" : "Send as new chat"}
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    );
-                  if (m.role === "assistant" && m.tool_calls)
-                    return (
-                      <div key={i} className="space-y-1">
-                        {m.tool_calls.map((tc) => (
-                          <ActivityNote
-                            key={tc.id}
-                            label={
-                              TOOL_LABELS[tc.function.name] ?? "Used a tool"
-                            }
-                          />
-                        ))}
+                    </div>
+                  ) : (
+                    <div
+                      key={g.index}
+                      className="group flex items-start justify-end gap-1"
+                    >
+                      {!thinking && !forking && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditIndex(g.index);
+                            setEditDraft(g.text);
+                          }}
+                          title="Edit and send as a new chat"
+                          aria-label="Edit this message and send it as a new chat"
+                          className="mt-1 grid h-7 w-7 shrink-0 place-items-center rounded-md text-ink-faint transition-colors hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100"
+                        >
+                          <IconPencil className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <div className="max-w-[80%] whitespace-pre-wrap rounded-lg rounded-br-sm bg-teal px-3.5 py-2.5 text-sm text-white">
+                        {g.text}
                       </div>
-                    );
-                  if (m.role === "assistant" && m.content)
-                    return (
-                      <div key={i} className="flex justify-start">
-                        <div className="min-w-0 max-w-[92%] rounded-lg rounded-bl-sm border border-line bg-surface-2 px-3.5 py-2.5 sm:max-w-[85%]">
-                          <Markdown text={m.content} />
-                        </div>
-                      </div>
-                    );
-                  return null;
-                })}
+                    </div>
+                  ),
+                )}
 
                 {thinking && (
-                  <div className="space-y-2">
-                    {steps.map((s) => (
-                      <ActivityNote
-                        key={s.id}
-                        live={!s.done}
-                        label={
-                          s.done
-                            ? (TOOL_LABELS[s.name] ?? "Used a tool")
-                            : (TOOL_RUNNING[s.name] ?? "Working")
-                        }
-                      />
-                    ))}
-                    {awaiting && (
-                      <ActivityNote live label="Waiting on your go-ahead" />
-                    )}
-                    {stream ? (
-                      <div className="flex justify-start">
-                        <div className="fo-streaming min-w-0 max-w-[92%] rounded-lg rounded-bl-sm border border-line bg-surface-2 px-3.5 py-2.5 sm:max-w-[85%]">
-                          <Markdown text={stream} />
-                        </div>
-                      </div>
-                    ) : (
-                      steps.every((s) => s.done) &&
-                      !awaiting && (
-                        <div className="flex items-center gap-2 px-1 text-sm text-ink-soft">
-                          <span className="h-3.5 w-3.5 rounded-full border-2 border-teal/30 border-t-teal fo-spin" />
-                          Thinking
-                        </div>
-                      )
-                    )}
-                  </div>
+                  <TurnGroup
+                    pieces={live}
+                    stream={stream}
+                    waiting={awaiting}
+                    pondering={
+                      !stream &&
+                      !awaiting &&
+                      live.every((p) => p.kind !== "tool" || p.done)
+                    }
+                  />
                 )}
 
                 {!done && pending.length > 0 && !thinking && (

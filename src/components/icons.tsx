@@ -157,6 +157,14 @@ export const IconPencil = (p: P) => (
   </S>
 );
 
+export const IconBranch = (p: P) => (
+  <S {...p}>
+    <path d="M6 5v14" />
+    <circle cx="17" cy="7" r="2.5" />
+    <path d="M6 12h5a4 4 0 0 0 4-4v-.5" />
+  </S>
+);
+
 export const IconKey = (p: P) => (
   <S {...p}>
     <circle cx="8" cy="12" r="4" />

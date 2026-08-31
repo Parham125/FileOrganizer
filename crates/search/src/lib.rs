@@ -131,6 +131,32 @@ impl Index {
         Ok(())
     }
 
+    /// Rewrite the indexed paths of everything beneath a moved folder, so the
+    /// index follows the move instead of keeping dead paths until a re-index.
+    /// Returns how many rows were repointed.
+    pub fn reparent(&self, old_dir: &Path, new_dir: &Path) -> Result<usize> {
+        let old = old_dir.to_string_lossy().to_string();
+        let new = new_dir.to_string_lossy().to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+        let old_prefix = format!("{}{}", old.trim_end_matches(sep), sep);
+        let new_prefix = format!("{}{}", new.trim_end_matches(sep), sep);
+        let like = format!(
+            "{}%",
+            old_prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let n = self.conn.execute(
+            "UPDATE files SET path = ?1 || substr(path, ?2)
+             WHERE path LIKE ?3 ESCAPE '\\'",
+            // SQLite substr() counts characters, not bytes, so a byte length
+            // would corrupt any path containing non-ASCII characters.
+            rusqlite::params![new_prefix, (old_prefix.chars().count() + 1) as i64, like],
+        )?;
+        Ok(n)
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.conn.execute_batch("DELETE FROM files;")?;
         Ok(())
@@ -288,6 +314,38 @@ mod tests {
     use super::*;
     use fo_indexer::{FileSource, WalkdirSource};
     use std::fs;
+
+    #[test]
+    fn reparent_follows_a_moved_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        // a non-ASCII segment: SQLite substr() is character-based, so a byte
+        // offset here would slice the path mid-character
+        let old = dir.path().join("عکس‌ها");
+        let inner = old.join("nested");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(old.join("a.jpg"), b"a").unwrap();
+        fs::write(inner.join("b.jpg"), b"bb").unwrap();
+        let outside = dir.path().join("keep.txt");
+        fs::write(&outside, b"c").unwrap();
+        let entries = WalkdirSource.enumerate(dir.path()).unwrap();
+        let mut idx = Index::open(&dir.path().join("index.db")).unwrap();
+        idx.upsert_batch(&entries).unwrap();
+        let new = dir.path().join("Photos");
+        assert_eq!(idx.reparent(&old, &new).unwrap(), 2);
+        let all = idx.search("", &SearchOpts::default()).unwrap();
+        let paths: Vec<&str> = all.iter().map(|h| h.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("Photos/a.jpg")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("Photos/nested/b.jpg")),
+            "{paths:?}"
+        );
+        assert!(paths.iter().all(|p| !p.contains("عکس‌ها")), "{paths:?}");
+        // a sibling outside the moved folder is untouched
+        assert!(paths.iter().any(|p| p.ends_with("keep.txt")), "{paths:?}");
+    }
 
     #[test]
     fn storage_stats_aggregate_by_size_and_ext() {

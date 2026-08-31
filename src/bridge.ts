@@ -369,12 +369,19 @@ function makeMoves(root: string): Move[] {
 }
 
 // OpenAI-format transcript pieces so the assistant view can render tool activity.
-function toolTurn(name: string, args: object, result: string): ChatMessage[] {
+// A model often says something before it calls a tool, so the assistant message
+// can carry that prose alongside the call.
+function toolTurn(
+  name: string,
+  args: object,
+  result: string,
+  prose?: string,
+): ChatMessage[] {
   const id = "call_" + rid();
   return [
     {
       role: "assistant",
-      content: null,
+      content: prose ?? null,
       tool_calls: [
         {
           id,
@@ -428,6 +435,30 @@ function makeChats(): Chat[] {
           role: "assistant",
           content:
             "Done. Both copies are in Trash and the originals in `~/Pictures` are untouched.",
+        },
+      ],
+    ],
+    [
+      0.9,
+      0.7,
+      [
+        { role: "user", content: "Where did my Reykjavik photos end up?" },
+        ...toolTurn(
+          "list_folder",
+          { path: "/Users/you/Pictures" },
+          "4 folders, 812 files.",
+          "Let me start with what is actually in `~/Pictures`.",
+        ),
+        ...toolTurn(
+          "find_duplicates",
+          { root: "/Users/you/Pictures/2026" },
+          "1 duplicate set across Pictures and Downloads.",
+          "They are in `Pictures/2026`, but three of the same names show up in Downloads too. Checking whether those are real copies.",
+        ),
+        {
+          role: "assistant",
+          content:
+            "All 41 Reykjavik shots live in `~/Pictures/2026`. The Downloads folder has one true copy, `reykjavik-0433.jpg`, at 8.9 MB.\n\nThe two `.raw` files with matching names are different exposures, not copies, so I left them alone.",
         },
       ],
     ],
@@ -526,12 +557,22 @@ function mockBridge(): Bridge {
     });
   }
 
-  // Mirrors the desktop agent loop: a thinking beat, each read tool opening and
-  // closing, then the reply arriving a word at a time.
-  async function streamTurn(tools: string[], text: string): Promise<void> {
+  // Mirrors the desktop agent loop: a thinking beat, whatever the model says
+  // before it reaches for a tool, each read tool opening and closing, then the
+  // reply arriving a word at a time.
+  async function streamTurn(
+    lead: string,
+    tools: string[],
+    text: string,
+  ): Promise<void> {
     const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
     emit("ai:step", { kind: "thinking" });
     await wait(200);
+    for (const frag of lead ? lead.split(/(?<=\s)/) : []) {
+      emit("ai:delta", frag);
+      await wait(14);
+    }
+    if (lead) await wait(180);
     for (const name of tools) {
       emit("ai:step", { kind: "tool", name });
       await wait(320);
@@ -843,7 +884,8 @@ function mockBridge(): Bridge {
             "",
             "Trash is reversible here, so anything you change your mind about comes back from the Trash view.",
           ].join("\n");
-          await streamTurn(["find_duplicates"], reply);
+          const lead = "Hashing everything under `~/Downloads` first.";
+          await streamTurn(lead, ["find_duplicates"], reply);
           emit("ai:step", { kind: "awaiting_approval" });
           emit("ai:done", undefined);
           const messages: ChatMessage[] = [
@@ -852,6 +894,7 @@ function mockBridge(): Bridge {
               "find_duplicates",
               { root: "/Users/you/Downloads" },
               "Found 3 duplicate sets, 14.6 MB reclaimable.",
+              lead,
             ),
             { role: "assistant", content: reply },
           ];
@@ -888,11 +931,12 @@ function mockBridge(): Bridge {
           "",
           "Say the word and I will stage the safe ones for Trash.",
         ].join("\n");
-        await streamTurn(["index_stats", "search_files"], reply);
+        const lead = "Let me check the index and the biggest files first.";
+        await streamTurn(lead, ["index_stats", "search_files"], reply);
         emit("ai:done", undefined);
         const messages: ChatMessage[] = [
           ...incoming,
-          ...toolTurn("index_stats", {}, "24,817 files indexed."),
+          ...toolTurn("index_stats", {}, "24,817 files indexed.", lead),
           ...toolTurn(
             "search_files",
             { min_size: 104_857_600 },
@@ -921,7 +965,7 @@ function mockBridge(): Bridge {
         else
           final_text =
             "No problem, I left everything where it is. Nothing was changed.";
-        await streamTurn(approved > 0 ? ["trash_files"] : [], final_text);
+        await streamTurn("", approved > 0 ? ["trash_files"] : [], final_text);
         emit("ai:done", undefined);
         const messages: ChatMessage[] = [...incoming];
         if (approved > 0) {

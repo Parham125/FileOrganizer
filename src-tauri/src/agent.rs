@@ -47,9 +47,10 @@ pub struct AgentResult {
 /// trash phase so the two locks never overlap.
 enum IndexFollowup {
     Remove(Vec<PathBuf>),
+    /// (from, to, is_dir) per moved item. A moved folder repoints every indexed
+    /// path beneath it; a moved file is just removed and re-added.
     Moved {
-        remove: Vec<PathBuf>,
-        upsert: Vec<PathBuf>,
+        moved: Vec<(PathBuf, PathBuf, bool)>,
     },
 }
 
@@ -155,15 +156,26 @@ fn summarize(name: &str, args: &Value) -> String {
     match name {
         "trash_files" => {
             let paths = args["paths"].as_array().cloned().unwrap_or_default();
+            let dirs = paths
+                .iter()
+                .filter_map(|p| p.as_str())
+                .filter(|p| Path::new(p).is_dir())
+                .count();
             let names: Vec<String> = paths
                 .iter()
                 .filter_map(|p| p.as_str())
                 .take(3)
                 .map(|p| {
-                    Path::new(p)
+                    let name = Path::new(p)
                         .file_name()
                         .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.to_string())
+                        .unwrap_or_else(|| p.to_string());
+                    // a folder must never read as a file in a proposal card
+                    if dirs > 0 && dirs < paths.len() && Path::new(p).is_dir() {
+                        format!("{} (folder)", name)
+                    } else {
+                        name
+                    }
                 })
                 .collect();
             let more = if paths.len() > 3 {
@@ -171,10 +183,18 @@ fn summarize(name: &str, args: &Value) -> String {
             } else {
                 String::new()
             };
+            let noun = if dirs == 0 {
+                "file"
+            } else if dirs == paths.len() {
+                "folder"
+            } else {
+                "item"
+            };
             let plural = if paths.len() == 1 { "" } else { "s" };
             format!(
-                "Move {} file{} to Trash: {}{}",
+                "Move {} {}{} to Trash: {}{}",
                 paths.len(),
+                noun,
                 plural,
                 names.join(", "),
                 more
@@ -182,6 +202,18 @@ fn summarize(name: &str, args: &Value) -> String {
         }
         "move_files" => {
             let moves = args["moves"].as_array().cloned().unwrap_or_default();
+            let dirs = moves
+                .iter()
+                .filter_map(|m| m["from"].as_str())
+                .filter(|p| Path::new(p).is_dir())
+                .count();
+            let noun = if dirs == 0 {
+                "file"
+            } else if dirs == moves.len() {
+                "folder"
+            } else {
+                "item"
+            };
             let plural = if moves.len() == 1 { "" } else { "s" };
             let dest = moves
                 .first()
@@ -194,9 +226,9 @@ fn summarize(name: &str, args: &Value) -> String {
                 })
                 .unwrap_or_default();
             if dest.is_empty() {
-                format!("Move {} file{}", moves.len(), plural)
+                format!("Move {} {}{}", moves.len(), noun, plural)
             } else {
-                format!("Move {} file{} into {}/", moves.len(), plural, dest)
+                format!("Move {} {}{} into {}/", moves.len(), noun, plural, dest)
             }
         }
         "create_rule" => {
@@ -346,7 +378,7 @@ fn destructive_trash_phase(
                 .map(|i| PathBuf::from(&i.original_path))
                 .collect();
             Ok((
-                json!({"trashed": op.items.len(), "op_id": op.id}),
+                json!({"trashed": op.items.len(), "op_id": op.id, "skipped": op.skipped}),
                 IndexFollowup::Remove(removed),
             ))
         }
@@ -365,19 +397,20 @@ fn destructive_trash_phase(
                 })
                 .unwrap_or_default();
             let op = trash.apply_moves(&pairs, "ai-move")?;
-            let remove: Vec<PathBuf> = op
+            let moved: Vec<(PathBuf, PathBuf, bool)> = op
                 .items
                 .iter()
-                .map(|i| PathBuf::from(&i.original_path))
-                .collect();
-            let upsert: Vec<PathBuf> = op
-                .items
-                .iter()
-                .map(|i| PathBuf::from(&i.stored_path))
+                .map(|i| {
+                    (
+                        PathBuf::from(&i.original_path),
+                        PathBuf::from(&i.stored_path),
+                        i.is_dir,
+                    )
+                })
                 .collect();
             Ok((
-                json!({"moved": op.items.len(), "op_id": op.id}),
-                IndexFollowup::Moved { remove, upsert },
+                json!({"moved": op.items.len(), "op_id": op.id, "skipped": op.skipped}),
+                IndexFollowup::Moved { moved },
             ))
         }
         _ => Err(anyhow!("unknown destructive tool: {}", name)),
@@ -391,9 +424,15 @@ fn apply_followup(index: &mut Index, followup: IndexFollowup) {
                 let _ = index.remove_path(p);
             }
         }
-        IndexFollowup::Moved { remove, upsert } => {
-            for p in &remove {
-                let _ = index.remove_path(p);
+        IndexFollowup::Moved { moved } => {
+            let mut upsert = Vec::new();
+            for (from, to, is_dir) in &moved {
+                let _ = index.remove_path(from);
+                if *is_dir {
+                    let _ = index.reparent(from, to);
+                } else {
+                    upsert.push(to.clone());
+                }
             }
             let entries = stat_entries(&upsert);
             if !entries.is_empty() {
@@ -675,6 +714,28 @@ mod tests {
             &json!({"moves": [{"from": "/x/a.jpg", "to": "/x/Photos/a.jpg"}]}),
         );
         assert_eq!(s, "Move 1 file into Photos/");
+    }
+
+    #[test]
+    fn summarize_labels_directories_as_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Photos");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = dir.path().join("report.pdf");
+        std::fs::write(&file, b"pdf").unwrap();
+        let s = summarize("trash_files", &json!({"paths": [folder.to_str().unwrap()]}));
+        assert_eq!(s, "Move 1 folder to Trash: Photos");
+        // mixed batch: neutral noun, and the folder is marked as one
+        let s = summarize(
+            "trash_files",
+            &json!({"paths": [file.to_str().unwrap(), folder.to_str().unwrap()]}),
+        );
+        assert_eq!(s, "Move 2 items to Trash: report.pdf, Photos (folder)");
+        let s = summarize(
+            "move_files",
+            &json!({"moves": [{"from": folder.to_str().unwrap(), "to": "/x/Sorted/Photos"}]}),
+        );
+        assert_eq!(s, "Move 1 folder into Sorted/");
     }
 
     #[test]

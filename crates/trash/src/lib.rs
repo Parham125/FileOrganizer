@@ -5,7 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A quarantined file that can be restored or purged.
+/// Walking a directory to size it stops here, so a pathological tree cannot
+/// stall an operation. The sum is then a floor, not an exact total.
+const WALK_LIMIT: usize = 100_000;
+
+/// A quarantined file or folder that can be restored or purged.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrashItem {
     pub id: String,
@@ -17,6 +21,14 @@ pub struct TrashItem {
     pub deleted_ns: i64,
     pub reason: Option<String>,
     pub restored: bool,
+    pub is_dir: bool,
+}
+
+/// Something the operation deliberately did not touch, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedItem {
+    pub path: String,
+    pub reason: String,
 }
 
 /// One batch operation (delete or move) grouping many items.
@@ -24,6 +36,7 @@ pub struct TrashItem {
 pub struct TrashOp {
     pub id: String,
     pub items: Vec<TrashItem>,
+    pub skipped: Vec<SkippedItem>,
 }
 
 /// Quarantine store + undo journal backed by its own SQLite DB.
@@ -55,9 +68,20 @@ impl Trash {
                 size INTEGER NOT NULL,
                 deleted_ns INTEGER NOT NULL,
                 reason TEXT,
-                restored INTEGER NOT NULL DEFAULT 0
+                restored INTEGER NOT NULL DEFAULT 0,
+                is_dir INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        // DBs created before folder support lack is_dir; add it once, in place.
+        let has_is_dir = conn
+            .prepare("SELECT 1 FROM pragma_table_info('trash_items') WHERE name = 'is_dir'")?
+            .exists([])?;
+        if !has_is_dir {
+            conn.execute(
+                "ALTER TABLE trash_items ADD COLUMN is_dir INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Trash { conn, trash_root })
     }
 
@@ -83,18 +107,40 @@ impl Trash {
             rusqlite::params![op_id, "delete", now, note],
         )?;
         let mut items = Vec::new();
+        let mut skipped = Vec::new();
         for path in paths {
-            if !fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+            let meta = match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped.push(skip(path, "source no longer exists"));
+                    continue;
+                }
+            };
+            let is_dir = meta.is_dir();
+            if !is_dir && !meta.is_file() {
+                skipped.push(skip(path, "not a file or folder"));
                 continue;
             }
             let filename = path
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".to_string());
-            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0) as i64;
+            let size = if is_dir {
+                dir_size(path)
+            } else {
+                meta.len() as i64
+            };
             let stored_name = format!("{}_{}", nanoid::nanoid!(20), filename);
             let stored_path = op_dir.join(&stored_name);
-            if move_file(path, &stored_path).is_err() {
+            if move_path(path, &stored_path, is_dir).is_err() {
+                skipped.push(skip(
+                    path,
+                    if is_dir {
+                        "could not move across volumes"
+                    } else {
+                        "could not be moved"
+                    },
+                ));
                 continue;
             }
             let id = nanoid::nanoid!(20);
@@ -103,8 +149,8 @@ impl Trash {
                 .conn
                 .execute(
                     "INSERT INTO trash_items
-                 (id, op_id, original_path, stored_path, size, deleted_ns, reason, restored)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                 (id, op_id, original_path, stored_path, size, deleted_ns, reason, restored, is_dir)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
                     rusqlite::params![
                         id,
                         op_id,
@@ -112,17 +158,19 @@ impl Trash {
                         stored_path.to_string_lossy().to_string(),
                         size,
                         now,
-                        reason
+                        reason,
+                        is_dir as i64
                     ],
                 )
                 .is_err()
             {
-                if move_file(&stored_path, path).is_err() {
+                if move_path(&stored_path, path, is_dir).is_err() {
                     return Err(anyhow!(
                         "journal insert failed and file could not be restored, stranded at {}",
                         stored_path.display()
                     ));
                 }
+                skipped.push(skip(path, "journal write failed"));
                 continue;
             }
             items.push(TrashItem {
@@ -134,13 +182,19 @@ impl Trash {
                 deleted_ns: now,
                 reason: Some(reason.to_string()),
                 restored: false,
+                is_dir,
             });
         }
-        Ok(TrashOp { id: op_id, items })
+        Ok(TrashOp {
+            id: op_id,
+            items,
+            skipped,
+        })
     }
 
     /// Apply a batch of moves as one reversible operation. Never overwrites; a
-    /// mid-move failure skips that file and keeps going. Undo puts each file back.
+    /// mid-move failure skips that entry, records why in `skipped`, and keeps
+    /// going. Undo puts each item back. Folders move whole or not at all.
     pub fn apply_moves(&self, moves: &[(PathBuf, PathBuf)], kind: &str) -> Result<TrashOp> {
         let op_id = nanoid::nanoid!(20);
         let now = now_ns();
@@ -149,25 +203,48 @@ impl Trash {
             rusqlite::params![op_id, kind, now, Option::<String>::None],
         )?;
         let mut items = Vec::new();
+        let mut skipped = Vec::new();
         for (from, to) in moves {
             if from == to {
                 continue;
             }
-            if !fs::metadata(from).map(|m| m.is_file()).unwrap_or(false) {
+            let meta = match fs::metadata(from) {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped.push(skip(from, "source no longer exists"));
+                    continue;
+                }
+            };
+            let is_dir = meta.is_dir();
+            if !is_dir && !meta.is_file() {
+                skipped.push(skip(from, "not a file or folder"));
                 continue;
             }
             if let Some(parent) = to.parent() {
                 if fs::create_dir_all(parent).is_err() {
+                    skipped.push(skip(from, "destination could not be created"));
                     continue;
                 }
             }
             let actual_to = if to.exists() {
-                unique_path(to)
+                unique_path(to, is_dir)
             } else {
                 to.clone()
             };
-            let size = fs::metadata(from).map(|m| m.len()).unwrap_or(0) as i64;
-            if move_file(from, &actual_to).is_err() {
+            let size = if is_dir {
+                dir_size(from)
+            } else {
+                meta.len() as i64
+            };
+            if move_path(from, &actual_to, is_dir).is_err() {
+                skipped.push(skip(
+                    from,
+                    if is_dir {
+                        "could not move across volumes"
+                    } else {
+                        "could not be moved"
+                    },
+                ));
                 continue;
             }
             let id = nanoid::nanoid!(20);
@@ -177,18 +254,19 @@ impl Trash {
                 .conn
                 .execute(
                     "INSERT INTO trash_items
-                 (id, op_id, original_path, stored_path, size, deleted_ns, reason, restored)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
-                    rusqlite::params![id, op_id, original, stored, size, now, kind],
+                 (id, op_id, original_path, stored_path, size, deleted_ns, reason, restored, is_dir)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+                    rusqlite::params![id, op_id, original, stored, size, now, kind, is_dir as i64],
                 )
                 .is_err()
             {
-                if move_file(&actual_to, from).is_err() {
+                if move_path(&actual_to, from, is_dir).is_err() {
                     return Err(anyhow!(
                         "journal insert failed and move could not be reverted, stranded at {}",
                         actual_to.display()
                     ));
                 }
+                skipped.push(skip(from, "journal write failed"));
                 continue;
             }
             items.push(TrashItem {
@@ -200,19 +278,25 @@ impl Trash {
                 deleted_ns: now,
                 reason: Some(kind.to_string()),
                 restored: false,
+                is_dir,
             });
         }
-        Ok(TrashOp { id: op_id, items })
+        Ok(TrashOp {
+            id: op_id,
+            items,
+            skipped,
+        })
     }
 
     /// Restore one item, returning (target where it now is, previous stored path).
     pub fn restore_item(&self, item_id: &str) -> Result<(PathBuf, PathBuf)> {
-        let (original, stored): (String, String) = self.conn.query_row(
-            "SELECT original_path, stored_path FROM trash_items WHERE id = ?1 AND restored = 0",
+        let (original, stored, is_dir): (String, String, bool) = self.conn.query_row(
+            "SELECT original_path, stored_path, is_dir FROM trash_items WHERE id = ?1 AND restored = 0",
             [item_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
         )?;
-        let target = self.restore_move(&PathBuf::from(&stored), &PathBuf::from(&original))?;
+        let target =
+            self.restore_move(&PathBuf::from(&stored), &PathBuf::from(&original), is_dir)?;
         self.conn.execute(
             "UPDATE trash_items SET restored = 1 WHERE id = ?1",
             [item_id],
@@ -263,9 +347,10 @@ impl Trash {
                 deleted_ns: r.get(5)?,
                 reason: r.get(6)?,
                 restored: r.get::<_, i64>(7)? != 0,
+                is_dir: r.get::<_, i64>(8)? != 0,
             })
         };
-        let base = "SELECT t.id, t.op_id, t.original_path, t.stored_path, t.size, t.deleted_ns, t.reason, t.restored
+        let base = "SELECT t.id, t.op_id, t.original_path, t.stored_path, t.size, t.deleted_ns, t.reason, t.restored, t.is_dir
              FROM trash_items t JOIN operations o ON o.id = t.op_id";
         if let Some(k) = kind {
             let mut stmt = self.conn.prepare(&format!(
@@ -291,7 +376,7 @@ impl Trash {
             |r| r.get(0),
         )?;
         if self.is_in_quarantine(Path::new(&stored)) {
-            let _ = fs::remove_file(&stored);
+            remove_stored(Path::new(&stored));
         }
         self.conn
             .execute("DELETE FROM trash_items WHERE id = ?1", [item_id])?;
@@ -310,7 +395,7 @@ impl Trash {
         };
         for path in &stored {
             if self.is_in_quarantine(Path::new(path)) {
-                let _ = fs::remove_file(path);
+                remove_stored(Path::new(path));
             }
         }
         self.conn
@@ -337,7 +422,7 @@ impl Trash {
         };
         for (id, stored) in rows {
             if self.is_in_quarantine(Path::new(&stored)) {
-                let _ = fs::remove_file(&stored);
+                remove_stored(Path::new(&stored));
             }
             self.conn
                 .execute("DELETE FROM trash_items WHERE id = ?1", [&id])?;
@@ -371,7 +456,7 @@ impl Trash {
                 break;
             }
             if self.is_in_quarantine(Path::new(&stored)) {
-                let _ = fs::remove_file(&stored);
+                remove_stored(Path::new(&stored));
             }
             self.conn
                 .execute("DELETE FROM trash_items WHERE id = ?1", [&id])?;
@@ -396,16 +481,16 @@ impl Trash {
         Ok(())
     }
 
-    fn restore_move(&self, stored: &Path, original: &Path) -> Result<PathBuf> {
+    fn restore_move(&self, stored: &Path, original: &Path, is_dir: bool) -> Result<PathBuf> {
         if let Some(parent) = original.parent() {
             fs::create_dir_all(parent)?;
         }
         let target = if original.exists() {
-            unique_restored_path(original)
+            unique_restored_path(original, is_dir)
         } else {
             original.to_path_buf()
         };
-        move_file(stored, &target)?;
+        move_path(stored, &target, is_dir)?;
         Ok(target)
     }
 }
@@ -415,6 +500,64 @@ fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+fn skip(path: &Path, reason: &str) -> SkippedItem {
+    SkippedItem {
+        path: path.to_string_lossy().to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Total bytes of the files under `dir`. `fs::metadata` on a directory reports
+/// the directory entry itself, which tells a user nothing, so walk it. Stops
+/// after WALK_LIMIT entries and returns what it has rather than running long.
+fn dir_size(dir: &Path) -> i64 {
+    let mut total = 0i64;
+    let mut seen = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let rd = match fs::read_dir(&current) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > WALK_LIMIT {
+                return total;
+            }
+            // file_type does not follow symlinks, so a link loop cannot trap us
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(ft) if ft.is_file() => {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0) as i64
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Move a file or a whole directory. Directories are rename-only: `fs::copy` is
+/// files-only, so a cross-volume directory move fails outright rather than
+/// leaving a half-copied tree behind.
+fn move_path(src: &Path, dst: &Path, is_dir: bool) -> Result<()> {
+    if is_dir {
+        fs::rename(src, dst)?;
+        return Ok(());
+    }
+    move_file(src, dst)
+}
+
+/// Delete a quarantined item from disk. Callers must have checked it is inside
+/// the quarantine root first.
+fn remove_stored(p: &Path) {
+    if p.is_dir() {
+        let _ = fs::remove_dir_all(p);
+    } else {
+        let _ = fs::remove_file(p);
+    }
 }
 
 /// Move a file, falling back to copy+remove across filesystem boundaries.
@@ -437,14 +580,11 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build a free "name (2).ext" path next to `target`, never overwriting.
-fn unique_path(target: &Path) -> PathBuf {
+/// Build a free "name (2).ext" path next to `target`, never overwriting. A
+/// folder keeps its whole name, so "my.stuff" does not become "my (2).stuff".
+fn unique_path(target: &Path, is_dir: bool) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let stem = target
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let ext = target.extension().map(|s| s.to_string_lossy().to_string());
+    let (stem, ext) = split_name(target, is_dir);
     for n in 2.. {
         let name = match &ext {
             Some(e) => format!("{} ({}).{}", stem, n, e),
@@ -458,16 +598,27 @@ fn unique_path(target: &Path) -> PathBuf {
     unreachable!()
 }
 
-/// Build a free "name (restored).ext" path next to `original`, never overwriting.
-fn unique_restored_path(original: &Path) -> PathBuf {
-    let parent = original.parent().unwrap_or_else(|| Path::new("."));
-    let stem = original
+/// Split a path into the (stem, extension) used to build collision-free names.
+/// Directories have no extension to preserve, so the whole name is the stem.
+fn split_name(p: &Path, is_dir: bool) -> (String, Option<String>) {
+    if is_dir {
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string());
+        return (name, None);
+    }
+    let stem = p
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let ext = original
-        .extension()
-        .map(|s| s.to_string_lossy().to_string());
+    (stem, p.extension().map(|s| s.to_string_lossy().to_string()))
+}
+
+/// Build a free "name (restored).ext" path next to `original`, never overwriting.
+fn unique_restored_path(original: &Path, is_dir: bool) -> PathBuf {
+    let parent = original.parent().unwrap_or_else(|| Path::new("."));
+    let (stem, ext) = split_name(original, is_dir);
     for n in 0.. {
         let suffix = if n == 0 {
             " (restored)".to_string()
@@ -623,31 +774,155 @@ mod tests {
     }
 
     #[test]
-    fn destructive_ops_skip_directories() {
+    fn apply_moves_moves_whole_directory_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let src = dir.path().join("src");
+        let tree = src.join("Photos");
+        fs::create_dir_all(tree.join("nested")).unwrap();
+        fs::write(tree.join("a.jpg"), b"aaaa").unwrap();
+        fs::write(tree.join("nested/b.jpg"), b"bbbbbb").unwrap();
+        let dest = dir.path().join("Sorted").join("Photos");
+        let trash = Trash::open(&data).unwrap();
+        let op = trash
+            .apply_moves(&[(tree.clone(), dest.clone())], "organize")
+            .unwrap();
+        assert_eq!(op.items.len(), 1);
+        assert!(op.skipped.is_empty());
+        assert!(!tree.exists());
+        assert!(dest.join("a.jpg").exists() && dest.join("nested/b.jpg").exists());
+        assert_eq!(fs::read(dest.join("nested/b.jpg")).unwrap(), b"bbbbbb");
+        // journal knows it is a folder and carries a real recursive size
+        let rows = trash.list(Some("organize"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_dir);
+        assert_eq!(rows[0].size, 10);
+        // undo puts the whole tree back where it was
+        let undone = trash.undo_last().unwrap();
+        assert_eq!(undone.len(), 1);
+        assert_eq!(undone[0].0, tree);
+        assert!(tree.join("nested/b.jpg").exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn directory_move_onto_existing_name_does_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let tree = dir.path().join("src").join("Photos");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("mine.jpg"), b"mine").unwrap();
+        let dest_parent = dir.path().join("Sorted");
+        let dest = dest_parent.join("Photos");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("theirs.jpg"), b"theirs").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        let op = trash
+            .apply_moves(&[(tree.clone(), dest.clone())], "organize")
+            .unwrap();
+        assert_eq!(op.items.len(), 1);
+        let landed = PathBuf::from(&op.items[0].stored_path);
+        assert_eq!(landed, dest_parent.join("Photos (2)"));
+        // both trees intact, neither clobbered the other
+        assert!(landed.join("mine.jpg").exists());
+        assert!(dest.join("theirs.jpg").exists());
+        assert!(!dest.join("mine.jpg").exists());
+        assert!(!tree.exists());
+    }
+
+    #[test]
+    fn apply_moves_reports_skips_and_still_processes_the_batch() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let src = dir.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        let tree = src.join("tree");
-        fs::create_dir_all(&tree).unwrap();
-        fs::write(tree.join("inner.txt"), b"inner").unwrap();
-        let file = src.join("file.txt");
+        let missing = src.join("ghost.txt");
+        let real = src.join("real.txt");
+        fs::write(&real, b"real").unwrap();
+        let dest = dir.path().join("Docs");
+        let trash = Trash::open(&data).unwrap();
+        let op = trash
+            .apply_moves(
+                &[
+                    (missing.clone(), dest.join("ghost.txt")),
+                    (real.clone(), dest.join("real.txt")),
+                ],
+                "organize",
+            )
+            .unwrap();
+        assert_eq!(op.skipped.len(), 1);
+        assert_eq!(op.skipped[0].path, missing.to_string_lossy());
+        assert_eq!(op.skipped[0].reason, "source no longer exists");
+        // the rest of the batch still went through
+        assert_eq!(op.items.len(), 1);
+        assert!(dest.join("real.txt").exists());
+    }
+
+    #[test]
+    fn trash_files_quarantines_and_restores_a_whole_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let tree = dir.path().join("src").join("Old");
+        fs::create_dir_all(tree.join("deep")).unwrap();
+        fs::write(tree.join("deep/x.txt"), b"xxxxx").unwrap();
+        let file = dir.path().join("src").join("file.txt");
         fs::write(&file, b"file").unwrap();
         let trash = Trash::open(&data).unwrap();
         let op = trash
             .trash_files(&[tree.clone(), file.clone()], "manual", None)
             .unwrap();
-        // directory skipped: not moved, no row; sibling file still trashed
-        assert_eq!(op.items.len(), 1);
-        assert!(tree.exists());
-        assert!(!file.exists());
-        // apply_moves also skips a directory source
-        let dest = dir.path().join("Docs");
-        let op2 = trash
-            .apply_moves(&[(tree.clone(), dest.join("tree"))], "organize")
-            .unwrap();
-        assert!(op2.items.is_empty());
-        assert!(tree.exists());
+        assert_eq!(op.items.len(), 2);
+        assert!(op.skipped.is_empty());
+        assert!(!tree.exists() && !file.exists());
+        let stored = PathBuf::from(&op.items[0].stored_path);
+        assert!(stored.join("deep/x.txt").exists());
+        assert!(op.items[0].is_dir && !op.items[1].is_dir);
+        assert_eq!(op.items[0].size, 5);
+        // restoring brings the whole tree back to its original path
+        trash.restore_op(&op.id).unwrap();
+        assert!(tree.join("deep/x.txt").exists());
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn purge_removes_a_quarantined_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let tree = dir.path().join("src").join("Old");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("x.txt"), b"x").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        let op = trash.trash_files(&[tree.clone()], "manual", None).unwrap();
+        let stored = PathBuf::from(&op.items[0].stored_path);
+        assert!(stored.is_dir());
+        trash.purge_op(&op.id).unwrap();
+        assert!(!stored.exists());
+        assert!(trash.list(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_dir_column_is_added_to_a_pre_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        fs::create_dir_all(data.join("trash")).unwrap();
+        // schema as it shipped before folder support
+        let conn = Connection::open(data.join("trash.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE operations (id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_ns INTEGER NOT NULL, note TEXT);
+            CREATE TABLE trash_items (id TEXT PRIMARY KEY, op_id TEXT NOT NULL REFERENCES operations(id), original_path TEXT NOT NULL, stored_path TEXT NOT NULL, size INTEGER NOT NULL, deleted_ns INTEGER NOT NULL, reason TEXT, restored INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO operations VALUES ('op1', 'delete', 1, NULL);
+            INSERT INTO trash_items VALUES ('it1', 'op1', '/x/a.txt', '/q/a.txt', 3, 1, 'manual', 0);",
+        )
+        .unwrap();
+        drop(conn);
+        // opening twice must both migrate and stay a no-op the second time
+        let trash = Trash::open(data).unwrap();
+        let rows = trash.list(None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].is_dir);
+        drop(trash);
+        let trash = Trash::open(data).unwrap();
+        assert_eq!(trash.list(None, 10).unwrap().len(), 1);
     }
 
     #[test]

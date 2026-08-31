@@ -8,6 +8,7 @@ import { IconPencil, IconTrash, IconX } from "../components/icons";
 export default function ChatHistory({
   chats,
   currentId,
+  branched,
   loading,
   loadingId,
   error,
@@ -19,6 +20,9 @@ export default function ChatHistory({
 }: {
   chats: ChatSummary[];
   currentId: string | null;
+  // Chats branched off during this session. Nothing is stored for it, so the
+  // tag is only a hint while the reader is still in the session that made them.
+  branched: string[];
   loading: boolean;
   loadingId: string | null;
   error: string;
@@ -187,6 +191,7 @@ export default function ChatHistory({
                       )}
                       {formatRelative(c.updated_ns)} · {c.message_count}{" "}
                       {c.message_count === 1 ? "message" : "messages"}
+                      {branched.includes(c.id) && " · branched"}
                     </span>
                   </button>
                   {/* Always reachable on touch; on a pointer device they stay
