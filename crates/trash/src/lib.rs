@@ -137,7 +137,7 @@ impl Trash {
             let meta = match fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => {
-                    skipped.push(skip(path, "source no longer exists"));
+                    skipped.push(skip(path, &missing_reason(path)));
                     continue;
                 }
             };
@@ -184,7 +184,7 @@ impl Trash {
                         skipped.push(skip(
                             path,
                             &format!(
-                                "needs {}, only {} free on the app's disk",
+                                "there is not enough room on the app's disk: it needs {}, only {} is free",
                                 human_bytes(size as u64),
                                 human_bytes(free)
                             ),
@@ -195,13 +195,16 @@ impl Trash {
             }
             let stored_name = format!("{}_{}", nanoid::nanoid!(20), filename);
             let stored_path = op_dir.join(&stored_name);
-            if move_path(path, &stored_path, is_dir).is_err() {
+            if let Err(e) = move_path(path, &stored_path, is_dir) {
+                // The OS reason is the actionable half here: read-only media, a
+                // permission wall and a folder straddling two drives all look the
+                // same without it.
                 skipped.push(skip(
                     path,
-                    if is_dir {
-                        "could not move across volumes"
+                    &if is_dir {
+                        format!("a folder can only move within its own drive, and this one could not: {e}")
                     } else {
-                        "could not be moved"
+                        format!("could not be moved: {e}")
                     },
                 ));
                 continue;
@@ -233,7 +236,10 @@ impl Trash {
                         stored_path.display()
                     ));
                 }
-                skipped.push(skip(path, "journal write failed"));
+                skipped.push(skip(
+                    path,
+                    "the undo journal could not record it, so it was left where it is",
+                ));
                 continue;
             }
             items.push(TrashItem {
@@ -715,6 +721,19 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Why a path could not be read, in words a user can act on. A parent folder
+/// that is gone too means an unplugged drive or a renamed folder far more often
+/// than one file vanishing on its own, and those need different fixes.
+fn missing_reason(path: &Path) -> String {
+    match path.parent() {
+        Some(p) if !p.exists() => format!(
+            "{} is not reachable, the drive holding it may not be connected",
+            p.display()
+        ),
+        _ => "source no longer exists".to_string(),
+    }
+}
+
 fn skip(path: &Path, reason: &str) -> SkippedItem {
     SkippedItem {
         path: path.to_string_lossy().to_string(),
@@ -789,7 +808,13 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
-    fs::remove_file(src)?;
+    // The copy is only a move once the source is gone. A read-only source folder
+    // fails here, and leaving the copy would double the file's footprint while
+    // the caller is told the move did not happen.
+    if let Err(e) = fs::remove_file(src) {
+        let _ = fs::remove_file(dst);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -1255,6 +1280,73 @@ mod tests {
         assert!(file.starts_with(&root), "{root:?}");
         // resolving works for a path that does not exist yet
         assert_eq!(volume_root(&dir.path().join("nope/deeper.txt")), Some(root));
+    }
+
+    #[test]
+    fn trash_files_reports_the_skip_and_still_trashes_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let missing = src.join("ghost.txt");
+        let real = src.join("real.txt");
+        fs::write(&real, b"real").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        let op = trash
+            .trash_files(&[missing.clone(), real.clone()], "manual", None)
+            .unwrap();
+        // both halves are reported: what moved and what did not, with a reason
+        assert_eq!(op.items.len(), 1);
+        assert_eq!(op.items[0].original_path, real.to_string_lossy());
+        assert_eq!(op.skipped.len(), 1);
+        assert_eq!(op.skipped[0].path, missing.to_string_lossy());
+        assert_eq!(op.skipped[0].reason, "source no longer exists");
+        assert!(!real.exists());
+        // only the file that moved is in the journal, so undo cannot claim more
+        assert_eq!(trash.list(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_missing_path_on_a_gone_folder_names_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let trash = Trash::open(&data).unwrap();
+        // stand in for an ejected drive: nothing above the file is there either
+        let gone = dir.path().join("Volumes-stub").join("Backup").join("a.txt");
+        let op = trash.trash_files(&[gone.clone()], "manual", None).unwrap();
+        assert!(op.items.is_empty());
+        assert_eq!(op.skipped.len(), 1);
+        assert!(op.skipped[0].reason.contains("may not be connected"));
+        assert!(op.skipped[0].reason.contains("Backup"));
+    }
+
+    /// A file that cannot be moved has to stay a file, not become a row the
+    /// caller de-indexes while the bytes are still sitting on the disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_moved_is_skipped_and_stays_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let locked = src.join("locked.txt");
+        fs::write(&locked, b"still here").unwrap();
+        let trash = Trash::open(&data).unwrap();
+        // a read-only parent blocks both the rename and the copy fallback's unlink
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
+        let op = trash.trash_files(&[locked.clone()], "manual", None).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(op.items.is_empty());
+        assert_eq!(op.skipped.len(), 1);
+        assert_eq!(op.skipped[0].path, locked.to_string_lossy());
+        assert!(op.skipped[0].reason.starts_with("could not be moved:"));
+        assert!(locked.exists(), "a skipped file must still be on disk");
+        assert_eq!(fs::read(&locked).unwrap(), b"still here");
+        // and no half-move left a second copy in the quarantine
+        assert!(trash.list(None, 10).unwrap().is_empty());
+        let op_dir = data.join("trash").join(&op.id);
+        assert_eq!(fs::read_dir(&op_dir).unwrap().count(), 0);
     }
 
     #[test]

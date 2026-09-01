@@ -91,6 +91,31 @@ export type NameScanResult = {
   cancelled: boolean;
   unavailable_roots: string[];
 };
+export type ExactGroup = {
+  hash: string;
+  size: number;
+  paths: string[];
+};
+// The answer to "are these the same file?" for one hand-picked set, from the
+// same staging the duplicate scan uses: size, partial hash, full hash.
+// Not a boolean, because a set can split: three same-named files where two match
+// and one differs come back as one group of 2 plus one entry in unique. Empty
+// groups with everything in unique is a real answer, same name and different
+// bytes. compared == 0 means nothing was looked at, which is a different thing,
+// and unreadable holds the files that could not be opened at all.
+// bytes_hashed is bytes actually read off the disk, partial reads included, so
+// only the files settled by size alone contribute nothing to it. cancelled is
+// true only for a run that stopped before it had an answer; a run that reached
+// the end is a verdict even if Stop was pressed a moment later.
+export type ExactCheck = {
+  groups: ExactGroup[];
+  unique: string[];
+  unreadable: string[];
+  compared: number;
+  bytes_hashed: number;
+  cancelled: boolean;
+};
+
 export type IndexResult = { count: number; cancelled: boolean };
 
 // An indexed folder and whether it can be reached right now. Rows from an
@@ -175,6 +200,33 @@ export type TrashItem = {
   restored: boolean;
 };
 
+// One path an operation deliberately did not touch, with the reason in plain
+// words: "source no longer exists", "could not be moved: Permission denied",
+// "there is not enough room on the app's disk...". Show it, do not count it.
+export type SkippedItem = {
+  path: string;
+  reason: string;
+};
+
+// What trash_files actually did. moved holds the files that reached the
+// quarantine, skipped the ones still sitting on disk and why. moved.length is
+// the only honest count to report: it is not the number of paths asked for.
+export type TrashOutcome = {
+  op_id: string;
+  moved: string[];
+  skipped: SkippedItem[];
+};
+
+// What ai_apply_organization actually did. moved is a count here, not a path
+// list like TrashOutcome's, because the plan already names every file. A file
+// the runtime refused to move is in skipped with the reason, so an applied plan
+// that moved nothing cannot read as an applied plan.
+export type ApplyOrganization = {
+  op_id: string;
+  moved: number;
+  skipped: SkippedItem[];
+};
+
 export type Progress = { done: number; total: number };
 
 // Saved cleanups: a filter over the index plus one action. Both actions route
@@ -200,7 +252,12 @@ export type Rule = {
   last_run_count: number;
 };
 
-export type RuleRun = { op_id: string; count: number };
+// count is what the run actually acted on, skipped everything it could not.
+export type RuleRun = {
+  op_id: string;
+  count: number;
+  skipped: SkippedItem[];
+};
 
 export type ViewId =
   | "search"

@@ -5,11 +5,15 @@ import { SMALL_PX, isImage, useThumbs } from "../thumbs";
 import { errorText, exportResults, isChanged, isMissing } from "../snapshot";
 import type { LoadedSnapshot, NamePayload, Verification } from "../snapshot";
 import type {
+  ExactCheck,
+  HashAlgo,
   NameGroup,
   NameScanResult,
   NameStrategy,
   Progress,
   ScanMode,
+  SkippedItem,
+  TrashOutcome,
 } from "../types";
 import { NameCoverageNote } from "../components/CoverageNote";
 import Pager from "../components/Pager";
@@ -32,11 +36,41 @@ import RevealButton, {
 import ScanModePicker from "../components/ScanModePicker";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import Stack from "../components/Stack";
 import StoppedNotice from "../components/StoppedNotice";
-import { IconCheck, IconChevron, IconFolder } from "../components/icons";
+import TrashSetButton from "../components/TrashSetButton";
+import {
+  IconCheck,
+  IconChevron,
+  IconFolder,
+  IconStop,
+} from "../components/icons";
 
 const PER_PAGE = 25;
+
+type NameSortKey = "size" | "files" | "name" | "same";
+
+// "Same size first" is the one worth verifying, so it sits with the others
+// rather than as a separate toggle.
+const SORT_OPTIONS: SortOption<NameSortKey>[] = [
+  { value: "size", label: "Total size", naturalDir: "desc" },
+  { value: "files", label: "Files in set", naturalDir: "desc" },
+  { value: "name", label: "Name", naturalDir: "asc" },
+  { value: "same", label: "Same size first", naturalDir: "desc" },
+];
+
+// One set's answer from verify_exact_match. covers is the exact list of files
+// the answer was measured over, so a set that loses a file to the Trash stops
+// showing a verdict that no longer describes it.
+type GroupCheck = {
+  covers: string;
+  running: boolean;
+  stopping: boolean;
+  result: ExactCheck | null;
+  error: string;
+};
 
 // What the scan reads: the whole index across every drive, or one picked folder.
 type NameScope = "indexed" | "folder";
@@ -58,6 +92,13 @@ function sizesOf(g: NameGroup): number[] {
   return g.files.map((f) => f.size);
 }
 
+function coverOf(g: NameGroup): string {
+  return g.files
+    .map((f) => f.path)
+    .sort()
+    .join("\n");
+}
+
 function keepOnly(g: NameGroup, paths: Set<string>): NameGroup {
   const files = g.files.filter((f) => paths.has(f.path));
   return {
@@ -68,6 +109,7 @@ function keepOnly(g: NameGroup, paths: Set<string>): NameGroup {
 }
 
 export default function SimilarNamesView({
+  algo,
   scanMode,
   onScanMode,
   onExact,
@@ -76,6 +118,7 @@ export default function SimilarNamesView({
   onOpenSaved,
   openBusy,
 }: {
+  algo: HashAlgo;
   scanMode: ScanMode;
   onScanMode: (m: ScanMode) => void;
   onExact: () => void;
@@ -98,6 +141,12 @@ export default function SimilarNamesView({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [confirming, setConfirming] = useState(false);
+  const [confirmSet, setConfirmSet] = useState<string | null>(null);
+  // What the last trash refused to touch, and which set's button asked for it,
+  // so the reasons land where the press happened instead of at the top of a
+  // long page. null means the footer asked.
+  const [skipped, setSkipped] = useState<SkippedItem[]>([]);
+  const [skippedFrom, setSkippedFrom] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
   const [stopped, setStopped] = useState(false);
@@ -106,8 +155,15 @@ export default function SimilarNamesView({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState("");
+  const [checks, setChecks] = useState<Record<string, GroupCheck>>({});
+  // Bumped every time the results are replaced. A check that was still hashing
+  // when that happened describes files this page no longer shows, so its answer
+  // is dropped rather than filed against the new set.
+  const generation = useRef(0);
+  const [inFlight, setInFlight] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
+  const sort = useSort<NameSortKey>("names", SORT_OPTIONS, "size");
   const files = useFileActions();
   const gone = (path: string) =>
     loaded != null && isMissing(loaded.checked, path);
@@ -137,7 +193,7 @@ export default function SimilarNamesView({
   // first page of what is left rather than on an empty page 7.
   useEffect(() => {
     setPage(0);
-  }, [filter.query, filter.ext, filter.minMb]);
+  }, [filter.query, filter.ext, filter.minMb, sort.key, sort.dir]);
 
   // A snapshot the page handed down. Nothing is preselected here for the same
   // reason a live name scan preselects nothing: these files only share a name.
@@ -153,10 +209,14 @@ export default function SimilarNamesView({
     if (payload.strategy) setStrategy(payload.strategy);
     setScanned(null);
     setSelection({});
+    generation.current++;
+    setChecks({});
     setPage(0);
     setError("");
     setDone("");
     setSaved("");
+    setSkipped([]);
+    setConfirmSet(null);
     onAdopted();
   }, [incoming, onAdopted]);
 
@@ -187,7 +247,11 @@ export default function SimilarNamesView({
     setLoaded(null);
     setAwayRoots([]);
     setSelection({});
+    generation.current++;
+    setChecks({});
     setPage(0);
+    setSkipped([]);
+    setConfirmSet(null);
     try {
       const res = await invoke<NameScanResult>("scan_similar_names", {
         root: scope === "indexed" ? null : root,
@@ -251,6 +315,104 @@ export default function SimilarNamesView({
     setDone("");
   }
 
+  // Opens and hashes the files in one set, the same staged comparison the exact
+  // scan runs. Nothing else on the page waits for it.
+  async function runCheck(g: NameGroup) {
+    const key = keyOf(g);
+    const covers = coverOf(g);
+    const paths = g.files.map((f) => f.path);
+    const gen = generation.current;
+    setChecks((prev) => ({
+      ...prev,
+      [key]: {
+        covers,
+        running: true,
+        stopping: false,
+        result: null,
+        error: "",
+      },
+    }));
+    // Counted apart from `checks`, which a new scan or an opened snapshot wipes
+    // while the backend is still hashing. Reading busy off that record would let
+    // a scan start and steal the cancel token out from under a live check.
+    setInFlight((n) => n + 1);
+    try {
+      const res = await invoke<ExactCheck>("verify_exact_match", {
+        paths,
+        algo,
+        mode: scanMode,
+      });
+      if (gen !== generation.current) return;
+      setChecks((prev) => ({
+        ...prev,
+        [key]: {
+          covers,
+          running: false,
+          stopping: false,
+          result: res,
+          error: "",
+        },
+      }));
+    } catch (e) {
+      if (gen !== generation.current) return;
+      // The command refuses oversized sets with its own wording, so it is
+      // shown as it came back rather than replaced with a guess.
+      setChecks((prev) => ({
+        ...prev,
+        [key]: {
+          covers,
+          running: false,
+          stopping: false,
+          result: null,
+          error: errorText(e),
+        },
+      }));
+    } finally {
+      setInFlight((n) => n - 1);
+    }
+  }
+
+  // Shares the scan flag with everything else that reads the disk, so this is
+  // the same stop the scan progress card uses. It reports whether it actually
+  // reached a running token: a false there means this check was never the one
+  // holding it, and the button has to say so instead of sitting on "Stopping"
+  // for a stop that did nothing.
+  async function stopCheck(key: string) {
+    setChecks((prev) =>
+      prev[key] ? { ...prev, [key]: { ...prev[key], stopping: true } } : prev,
+    );
+    try {
+      const hit = await invoke<boolean>("cancel_scan");
+      if (!hit)
+        setChecks((prev) =>
+          prev[key]
+            ? {
+                ...prev,
+                [key]: {
+                  ...prev[key],
+                  stopping: false,
+                  error:
+                    "Nothing was stopped. This check is still reading and will finish on its own.",
+                },
+              }
+            : prev,
+        );
+    } catch (e) {
+      setChecks((prev) =>
+        prev[key]
+          ? {
+              ...prev,
+              [key]: {
+                ...prev[key],
+                stopping: false,
+                error: `Could not stop: ${errorText(e)}`,
+              },
+            }
+          : prev,
+      );
+    }
+  }
+
   // Over every loaded group, not just the visible ones: a pick made before the
   // filter went on is still a pick, and it is still going to the Trash.
   const summary = useMemo(() => {
@@ -272,13 +434,31 @@ export default function SimilarNamesView({
     return { count, bytes, invalid, sets, hidden };
   }, [groups, selection, filter.shows, loaded]);
 
+  // Ordering runs over what the filter left and before the page is cut, or the
+  // second page would hold rows from the unsorted list.
+  const ordered = useMemo(() => {
+    if (!filter.filtered) return null;
+    return sorted(
+      filter.filtered,
+      (g) =>
+        sort.key === "name"
+          ? g.stem
+          : sort.key === "files"
+            ? g.files.length
+            : sort.key === "same"
+              ? g.all_same_size
+                ? 1
+                : 0
+              : g.files.reduce((n, f) => n + f.size, 0),
+      sort.dir,
+    );
+  }, [filter.filtered, sort.key, sort.dir]);
   const nothingIndexed = roots !== null && roots.length === 0;
-  const listed = filter.filtered?.length ?? 0;
+  const listed = ordered?.length ?? 0;
   const pages = Math.max(1, Math.ceil(listed / PER_PAGE));
   const from = page * PER_PAGE;
-  const shown = filter.filtered
-    ? filter.filtered.slice(from, from + PER_PAGE)
-    : [];
+  const shown = ordered ? ordered.slice(from, from + PER_PAGE) : [];
+  const checkBusy = inFlight > 0;
   const media = strategy === "media";
   // Only the sets on this page. Nothing off screen is ever requested, and what
   // has already arrived is served from the module cache when paging back.
@@ -287,31 +467,79 @@ export default function SimilarNamesView({
     SMALL_PX,
   );
 
+  // Shared by the footer and by the per-set button. trash_files reports what it
+  // actually moved, so only res.moved leaves the list, the selection, and the
+  // reclaimed total. Anything it refused stays on screen and stays ticked, and
+  // its set is kept alive even at one file so the reader can still see it and
+  // try again. Throws when nothing moved, so the caller reports it where it was
+  // pressed rather than showing a done line for work that did not happen.
+  async function removePaths(paths: string[], from: string | null) {
+    const res = await invoke<TrashOutcome>("trash_files", {
+      paths,
+      reason: "dedup",
+    });
+    if (res.moved.length === 0) {
+      setDone("");
+      setSkipped(res.skipped);
+      setSkippedFrom(from);
+      throw new Error(
+        res.skipped.length > 0
+          ? "nothing moved, every file was refused. The reasons are listed below."
+          : "nothing moved, and the Trash gave no reason.",
+      );
+    }
+    const removed = new Set(res.moved);
+    const stuck = new Set(res.skipped.map((s) => s.path));
+    let freed = 0;
+    for (const g of groups ?? [])
+      for (const f of g.files) if (removed.has(f.path)) freed += f.size;
+    const remaining = (groups ?? [])
+      .map((g) => {
+        const files = g.files.filter((f) => !removed.has(f.path));
+        return {
+          ...g,
+          files,
+          all_same_size: files.every((f) => f.size === files[0]?.size),
+        };
+      })
+      .filter(
+        (g) => g.files.length > 1 || g.files.some((f) => stuck.has(f.path)),
+      );
+    setGroups(remaining);
+    setGroupCount(remaining.length);
+    setPage((p) =>
+      Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
+    );
+    setSelection((prev) => {
+      const next: Record<string, Set<string>> = {};
+      for (const g of remaining) {
+        const kept = new Set(
+          [...(prev[keyOf(g)] ?? [])].filter((p) => !removed.has(p)),
+        );
+        if (kept.size > 0) next[keyOf(g)] = kept;
+      }
+      return next;
+    });
+    setConfirming(false);
+    setConfirmSet(null);
+    setError("");
+    setSkipped(res.skipped);
+    setSkippedFrom(from);
+    const n = res.moved.length;
+    setDone(
+      n === paths.length
+        ? `Moved ${n} ${n === 1 ? "file" : "files"} to Trash and freed ${formatSize(freed)}. Restore anytime from Trash.`
+        : `Moved ${n} of the ${paths.length} files you picked to Trash and freed ${formatSize(freed)}. Restore anytime from Trash.`,
+    );
+  }
+
   async function trashSelected() {
     const paths: string[] = [];
     for (const g of groups ?? [])
       for (const p of selection[keyOf(g)] ?? []) paths.push(p);
     if (paths.length === 0) return;
-    const freed = summary.bytes;
     try {
-      await invoke<string>("trash_files", { paths, reason: "dedup" });
-      const removed = new Set(paths);
-      const remaining = (groups ?? [])
-        .map((g) => ({
-          ...g,
-          files: g.files.filter((f) => !removed.has(f.path)),
-        }))
-        .filter((g) => g.files.length > 1);
-      setGroups(remaining);
-      setGroupCount(remaining.length);
-      setPage((p) =>
-        Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
-      );
-      setSelection({});
-      setConfirming(false);
-      setDone(
-        `Moved ${paths.length} ${paths.length === 1 ? "file" : "files"} to Trash and freed ${formatSize(freed)}. Restore anytime from Trash.`,
-      );
+      await removePaths(paths, null);
     } catch (e) {
       setError(`Could not move files: ${errorText(e)}`);
       setConfirming(false);
@@ -345,11 +573,21 @@ export default function SimilarNamesView({
               {root ? "Change folder" : "Pick folder"}
             </button>
           )}
+          {/* A check and a scan share one cancel token, so the second one to
+              start takes it and Stop then hits the wrong job. The check already
+              waits for the scan, and this is the other half of that. */}
+          {checkBusy && !scanning && (
+            <span className="max-w-xs text-xs leading-relaxed text-ink-soft">
+              A set is being checked byte for byte. Let it finish or stop it
+              first, then scan.
+            </span>
+          )}
           <button
             type="button"
             onClick={scan}
             disabled={
               scanning ||
+              checkBusy ||
               (scope === "indexed" ? roots === null || nothingIndexed : !root)
             }
             className="inline-flex items-center gap-2 rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white transition-colors hover:brightness-95 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
@@ -487,6 +725,9 @@ export default function SimilarNamesView({
           <span>{done}</span>
         </div>
       )}
+      {skippedFrom === null && skipped.length > 0 && (
+        <SkippedNote items={skipped} />
+      )}
 
       {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
@@ -543,7 +784,12 @@ export default function SimilarNamesView({
             )}
           </div>
 
-          <ResultFilters filter={filter} unit="sets" />
+          <div className="space-y-2">
+            <ResultFilters filter={filter} unit="sets" />
+            <div className="flex justify-end">
+              <SortPicker sort={sort} label="Sort sets by" />
+            </div>
+          </div>
 
           {listed === 0 ? (
             <NoFilterMatch filter={filter} unit="sets" />
@@ -562,17 +808,30 @@ export default function SimilarNamesView({
               )}
 
               <div ref={listRef} className="space-y-4">
-                {shown.map((g) => (
-                  <NameGroupCard
-                    key={keyOf(g)}
-                    group={g}
-                    selected={selection[keyOf(g)] ?? new Set<string>()}
-                    onToggle={(p) => toggle(keyOf(g), p)}
-                    files={files}
-                    thumb={thumb}
-                    checked={loaded?.checked ?? null}
-                  />
-                ))}
+                {shown.map((g) => {
+                  const held = checks[keyOf(g)];
+                  return (
+                    <NameGroupCard
+                      key={keyOf(g)}
+                      group={g}
+                      selected={selection[keyOf(g)] ?? new Set<string>()}
+                      onToggle={(p) => toggle(keyOf(g), p)}
+                      files={files}
+                      thumb={thumb}
+                      checked={loaded?.checked ?? null}
+                      check={held && held.covers === coverOf(g) ? held : null}
+                      onCheck={() => runCheck(g)}
+                      onStop={() => stopCheck(keyOf(g))}
+                      busy={scanning || checkBusy}
+                      confirmOpen={confirmSet === keyOf(g)}
+                      onConfirmOpen={(open) =>
+                        setConfirmSet(open ? keyOf(g) : null)
+                      }
+                      onTrashSet={(paths) => removePaths(paths, keyOf(g))}
+                      skipped={skippedFrom === keyOf(g) ? skipped : null}
+                    />
+                  );
+                })}
               </div>
 
               {pages > 1 && (
@@ -592,7 +851,7 @@ export default function SimilarNamesView({
       )}
 
       {summary.count > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:left-56">
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface px-4 py-3 md:left-56">
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
             {confirming ? (
               <>
@@ -604,6 +863,19 @@ export default function SimilarNamesView({
                   </span>
                   ? These were matched by name, so open anything you are unsure
                   about first. You can restore them later.
+                  {/* Ticking every box in a set is allowed, but it is the one
+                      case that leaves no file behind, so it is said out loud
+                      before anything moves. */}
+                  {summary.invalid > 0 && (
+                    <>
+                      {" "}
+                      <span className="text-ochre">
+                        {summary.invalid}{" "}
+                        {summary.invalid === 1 ? "set" : "sets"} would be
+                        emptied completely, keeping no file on disk.
+                      </span>
+                    </>
+                  )}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -664,8 +936,7 @@ export default function SimilarNamesView({
                 <button
                   type="button"
                   onClick={() => setConfirming(true)}
-                  disabled={summary.invalid > 0}
-                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   Move selected to Trash
                 </button>
@@ -674,6 +945,32 @@ export default function SimilarNamesView({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// What the Trash refused to take, in its own words. The backend writes each
+// reason as a finished sentence, so it is shown as it came back.
+function SkippedNote({ items }: { items: SkippedItem[] }) {
+  return (
+    <div className="rounded-md border border-ochre/40 bg-ochre-soft px-3.5 py-2.5 text-sm text-ochre">
+      <p className="font-medium">
+        {items.length} {items.length === 1 ? "file" : "files"} did not move and{" "}
+        {items.length === 1 ? "is" : "are"} still on disk.{" "}
+        {items.length === 1 ? "It stays" : "They stay"} listed here, and
+        anything you had ticked stays ticked, so you can fix the reason and try
+        again.
+      </p>
+      <ul className="mt-1.5 space-y-1.5">
+        {items.map((s) => (
+          <li key={s.path} className="text-xs leading-relaxed">
+            <span className="block truncate font-mono" title={s.path}>
+              {s.path}
+            </span>
+            <span className="block">{s.reason}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -687,6 +984,14 @@ function NameGroupCard({
   files,
   thumb,
   checked,
+  check,
+  onCheck,
+  onStop,
+  busy,
+  confirmOpen,
+  onConfirmOpen,
+  onTrashSet,
+  skipped,
 }: {
   group: NameGroup;
   selected: Set<string>;
@@ -694,6 +999,14 @@ function NameGroupCard({
   files: ReturnType<typeof useFileActions>;
   thumb: (path: string) => string | null | undefined;
   checked: Verification | null;
+  check: GroupCheck | null;
+  onCheck: () => void;
+  onStop: () => void;
+  busy: boolean;
+  confirmOpen: boolean;
+  onConfirmOpen: (open: boolean) => void;
+  onTrashSet: (paths: string[]) => Promise<void>;
+  skipped: SkippedItem[] | null;
 }) {
   const media = group.strategy === "media";
   const largest = Math.max(...group.files.map((f) => f.size), 1);
@@ -701,6 +1014,76 @@ function NameGroupCard({
   // One image in the set gives the whole set a preview column, so the rows stay
   // lined up whether or not a given preview ever arrives.
   const previews = group.files.some((f) => isImage(f.path));
+  const result = check?.result ?? null;
+  // A cancelled run and a run that opened nothing are not verdicts, so only a
+  // finished comparison is allowed to mark rows or replace the size hint.
+  const measured =
+    result != null && !result.cancelled && result.compared > 0 ? result : null;
+  const matched = measured
+    ? measured.groups.reduce((n, g) => n + g.paths.length, 0)
+    : 0;
+  // Two pairs that match inside themselves are not one identical set, so the
+  // count of groups decides the wording as much as the count of files does.
+  const sets = measured ? measured.groups.length : 0;
+  const allSame =
+    measured != null &&
+    measured.groups.length === 1 &&
+    measured.unique.length === 0 &&
+    measured.unreadable.length === 0 &&
+    matched === group.files.length;
+  // Which file landed where, so the rows themselves carry the split instead of
+  // the reader matching paths against a paragraph.
+  const marks = useMemo(() => {
+    const out = new Map<string, { label: string; tone: string }>();
+    if (!measured) return out;
+    measured.groups.forEach((g, i) => {
+      // A 512-path set can split further than the alphabet goes, so past Z the
+      // labels carry on AA, AB rather than into punctuation.
+      let tag = "";
+      for (let n = i; ; n = Math.floor(n / 26) - 1) {
+        tag = String.fromCharCode(65 + (n % 26)) + tag;
+        if (n < 26) break;
+      }
+      const label =
+        measured.groups.length > 1 ? `Identical ${tag}` : "Identical";
+      for (const p of g.paths)
+        out.set(p, {
+          label,
+          tone: "border-teal-line bg-teal-soft text-teal",
+        });
+    });
+    for (const p of measured.unique)
+      out.set(p, {
+        label: "Different bytes",
+        tone: "border-line bg-surface-2 text-ink-soft",
+      });
+    for (const p of measured.unreadable)
+      out.set(p, {
+        label: "Could not read",
+        tone: "border-ochre/40 bg-ochre-soft text-ochre",
+      });
+    return out;
+  }, [measured]);
+  // A path a snapshot says is gone cannot be trashed, so the whole set button
+  // offers only what is still on disk.
+  const live = group.files
+    .filter((f) => !(checked != null && isMissing(checked, f.path)))
+    .map((f) => f.path);
+  // The one clause that is true here and in neither other tab: a name set is a
+  // guess until someone runs the exact check on it. Once a verdict exists the
+  // question repeats what was actually measured instead.
+  const note = measured
+    ? (allSame
+        ? `The exact check read all ${group.files.length} and found them byte for byte identical, so this leaves no copy of that file anywhere.`
+        : measured.compared === 1
+          ? "The exact check could open only one of these, so nothing here was ever compared against anything."
+          : matched > 0
+            ? `The exact check compared ${measured.compared} of these and only ${matched} are byte for byte identical, so the rest are separate files.`
+            : `The exact check compared ${measured.compared} of these and none of them matched each other, so every one is a separate file.`) +
+      (measured.unreadable.length > 0
+        ? ` ${measured.unreadable.length} could not be opened and ${measured.unreadable.length === 1 ? "was" : "were"} never compared.`
+        : "")
+    : "Nothing here has been compared byte for byte. These files share a name and nothing else, so two of them can hold completely different things.";
   return (
     <div className="rounded-lg border border-line bg-surface">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
@@ -723,24 +1106,194 @@ function NameGroupCard({
               )}
             </div>
             <div className="text-xs text-ink-faint">
-              {group.files.length} files{" "}
-              {media ? "share this title across containers" : "share this name"}
+              {/* A set can be left at one file when the Trash refused the rest,
+                  so the count carries its own verb. */}
+              {group.files.length}{" "}
+              {group.files.length === 1
+                ? media
+                  ? "file carries this title, the rest could not be moved"
+                  : "file carries this name, the rest could not be moved"
+                : media
+                  ? "files share this title across containers"
+                  : "files share this name"}
             </div>
           </div>
         </div>
-        {group.all_same_size ? (
-          <span className="shrink-0 text-xs text-ink-soft">
-            All {formatSize(largest)}, size matches
-          </span>
-        ) : (
-          <span className="shrink-0 rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
-            {formatSize(smallest)} to {formatSize(largest)}
-          </span>
-        )}
+        <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-2">
+          {measured ? (
+            <span
+              className={
+                "rounded-[3px] border px-1.5 py-0.5 text-xs font-medium " +
+                (allSame
+                  ? "border-teal-line bg-teal-soft text-teal"
+                  : matched > 0
+                    ? "border-ochre/40 bg-ochre-soft text-ochre"
+                    : "border-line bg-surface-2 text-ink-soft")
+              }
+            >
+              {allSame
+                ? `All ${group.files.length} identical`
+                : sets > 1
+                  ? `${sets} identical groups`
+                  : matched > 0
+                    ? `${matched} identical`
+                    : measured.compared === 1
+                      ? "Nothing to compare"
+                      : "No byte match"}
+            </span>
+          ) : null}
+          {measured != null && measured.unreadable.length > 0 && (
+            <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
+              {measured.unreadable.length} unread
+            </span>
+          )}
+          {measured == null &&
+            (group.all_same_size ? (
+              <span className="text-xs text-ink-soft">
+                All {formatSize(largest)}, size matches
+              </span>
+            ) : (
+              <span className="rounded-[3px] border border-ochre/40 bg-ochre-soft px-1.5 py-0.5 text-xs font-medium text-ochre">
+                {formatSize(smallest)} to {formatSize(largest)}
+              </span>
+            ))}
+          {check?.running ? (
+            <button
+              type="button"
+              onClick={onStop}
+              disabled={check.stopping}
+              className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-line-strong disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+            >
+              {check.stopping ? (
+                <span className="h-3.5 w-3.5 rounded-full border-2 border-ink-faint/40 border-t-ink-faint fo-spin" />
+              ) : (
+                <IconStop className="h-3.5 w-3.5" />
+              )}
+              {check.stopping ? "Stopping" : "Stop"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onCheck}
+              disabled={busy}
+              className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-xs font-medium text-ink transition-colors hover:border-line-strong disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+            >
+              {check ? "Check again" : "Check for exact match"}
+            </button>
+          )}
+          {live.length > 0 && (
+            <TrashSetButton
+              paths={live}
+              noun="file"
+              note={note}
+              open={confirmOpen}
+              onOpen={onConfirmOpen}
+              onTrash={onTrashSet}
+            />
+          )}
+        </div>
       </div>
+      {skipped != null && skipped.length > 0 && (
+        <div className="border-b border-line px-4 py-3">
+          <SkippedNote items={skipped} />
+        </div>
+      )}
+      {check && (check.error !== "" || check.running || result != null) && (
+        <div className="border-b border-line px-4 py-3 text-sm leading-relaxed">
+          {check.error !== "" && <p className="text-brick">{check.error}</p>}
+          {check.running && (
+            <p className="flex items-center gap-2 text-ink-soft">
+              <span className="h-3.5 w-3.5 shrink-0 rounded-full border-2 border-ink-faint/40 border-t-ink-faint fo-spin" />
+              Comparing these {group.files.length} files byte for byte. The rest
+              of the list stays open while it runs.
+            </p>
+          )}
+          {result?.cancelled && (
+            <p className="text-ochre">
+              {result.compared === 0
+                ? "You stopped this check before it read anything, so none of these files have been compared."
+                : `You stopped this check. It got through ${result.compared} of ${group.files.length} files, so this is not a verdict yet. Check again to finish.`}
+            </p>
+          )}
+          {result != null && !result.cancelled && result.compared === 0 && (
+            <p className="text-ochre">
+              Nothing in this set was opened, so this says nothing about whether
+              the files match.
+              {result.unreadable.length > 0 &&
+                ` All ${result.unreadable.length} refused to open: the drive may be unplugged, or the paths may not be plain files.`}
+            </p>
+          )}
+          {allSame && (
+            <p className="text-teal">
+              All {group.files.length} files are byte for byte identical.
+              Keeping one and moving the rest to Trash is safe.
+            </p>
+          )}
+          {measured != null && !allSame && sets > 1 && (
+            <p className="text-ink">
+              These {measured.compared} files split into {sets} identical groups
+              {measured.unique.length > 0
+                ? `, and ${measured.unique.length} match nothing else`
+                : ""}
+              . Each row below says which group it fell into.
+            </p>
+          )}
+          {measured != null &&
+            !allSame &&
+            sets === 1 &&
+            measured.unique.length === 0 && (
+              <p className="text-ink">
+                All {matched} files that were compared are byte for byte
+                identical. Keeping one of them and moving the rest to Trash is
+                safe.
+              </p>
+            )}
+          {measured != null && sets === 1 && measured.unique.length > 0 && (
+            <p className="text-ink">
+              {matched} of {measured.compared} files are byte for byte
+              identical, the rest only share the name. Each row below says which
+              it is.
+            </p>
+          )}
+          {measured != null && matched === 0 && measured.compared === 1 && (
+            <p className="text-ochre">
+              Only one file here could be opened, so there was nothing to
+              compare it against.
+            </p>
+          )}
+          {measured != null && matched === 0 && measured.compared > 1 && (
+            <p className="text-ink">
+              Same name, different bytes. None of these {measured.compared}{" "}
+              files match each other, so there is no copy here to remove.
+            </p>
+          )}
+          {/* Every cancelled run also comes back with a populated unreadable
+              list, so this is tied to a verdict: a coverage claim next to "none
+              of these have been compared" contradicts it. */}
+          {measured != null && measured.unreadable.length > 0 && (
+            <p className="mt-1 text-ochre">
+              {measured.unreadable.length}{" "}
+              {measured.unreadable.length === 1 ? "file" : "files"} could not be
+              opened, so this covers only the other {measured.compared}. The
+              drive may be unplugged, or the path may not be a plain file.
+            </p>
+          )}
+          {result != null && result.bytes_hashed > 0 && (
+            <p className="mt-1 text-xs text-ink-faint">
+              <span className="font-mono">
+                {formatSize(result.bytes_hashed)}
+              </span>{" "}
+              read from disk, including the 16 KB probe taken from every file
+              that got past the size check. Only files ruled out by size alone
+              were never opened.
+            </p>
+          )}
+        </div>
+      )}
       <ul>
         {group.files.map((f) => {
           const remove = selected.has(f.path);
+          const mark = marks.get(f.path);
           const lost = checked != null && isMissing(checked, f.path);
           const cut = Math.max(
             f.path.lastIndexOf("/"),
@@ -846,6 +1399,16 @@ function NameGroupCard({
                   <span className="block text-xs text-ink-faint">
                     {formatDate(f.modified_ns) || "no date"}
                   </span>
+                  {mark && (
+                    <span
+                      className={
+                        "mt-1 inline-block rounded-[3px] border px-1.5 py-0.5 text-xs font-medium " +
+                        mark.tone
+                      }
+                    >
+                      {mark.label}
+                    </span>
+                  )}
                   {lost ? (
                     <span className="mt-1 block">
                       <MissingTag />

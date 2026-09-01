@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatDate, formatSize } from "../format";
+import { baseName, shortestPath } from "../paths";
 import { LARGE_PX, useThumbs } from "../thumbs";
 import { errorText, exportResults, isChanged, isMissing } from "../snapshot";
 import type { LoadedSnapshot, SimilarPayload } from "../snapshot";
@@ -10,6 +11,8 @@ import type {
   SimilarFile,
   SimilarGroup,
   SimilarScanResult,
+  SkippedItem,
+  TrashOutcome,
 } from "../types";
 import ResultFilters, {
   NoFilterMatch,
@@ -30,9 +33,12 @@ import SnapshotBanner, {
   OpenSavedButton,
   SnapshotNote,
 } from "../components/SnapshotBanner";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import Stack from "../components/Stack";
 import StoppedNotice from "../components/StoppedNotice";
 import Thumb from "../components/Thumb";
+import TrashSetButton from "../components/TrashSetButton";
 import { IconCheck, IconFolder } from "../components/icons";
 
 // Each set is a grid of previews rather than a list, so a page holds far fewer
@@ -50,10 +56,40 @@ function pathsOf(g: SimilarGroup): string[] {
   return g.files.map((f) => f.path);
 }
 
-function shortestPath(paths: string[]): string {
-  return [...paths].sort(
-    (a, b) => a.length - b.length || a.localeCompare(b),
-  )[0];
+// The word for one file in a set, in one place: the set button asks about
+// photos and the message it leaves behind has to say the same word.
+const SET_NOUN = { one: "photo", many: "photos" };
+
+// Where a partial trash gets reported. from is the key of the set whose own
+// button was pressed, or null for the footer, so the note lands where the press
+// happened rather than at the top of a page the reader has scrolled past.
+type Skipped = { from: string | null; items: SkippedItem[] };
+
+// What trash_files refused to move, in the words the backend already wrote.
+// Reasons are shown verbatim: they name the drive, the free space, or the OS
+// error, and any summary of that is a worse answer than the answer.
+function SkippedNote({ items }: { items: SkippedItem[] }) {
+  return (
+    <div className="rounded-md border border-ochre/40 bg-ochre-soft px-3.5 py-2.5 text-left text-sm text-ochre">
+      <p className="font-medium">
+        {items.length} {items.length === 1 ? "file is" : "files are"} still on
+        disk and {items.length === 1 ? "was" : "were"} not moved
+      </p>
+      {/* Every path is listed, but a whole disconnected drive can be a hundred
+          of them and this note sits in a fixed footer, so the list scrolls
+          instead of pushing the buttons off the screen. */}
+      <ul className="mt-1.5 max-h-40 space-y-1.5 overflow-y-auto">
+        {items.map((s) => (
+          <li key={s.path}>
+            <span className="block truncate font-mono text-xs" title={s.path}>
+              {s.path}
+            </span>
+            <span className="block text-xs">{s.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 // Selected == the copies to remove. Default keeps the shortest path still on
@@ -73,6 +109,17 @@ type Coverage = {
   unreadable: number;
   tooMany: number | null;
 };
+
+type ImageSort = "total" | "files" | "closeness" | "name";
+
+// Closeness is the perceptual distance, where a smaller number means the photos
+// look more alike, so its natural order is ascending unlike every other key.
+const IMAGE_SORTS: SortOption<ImageSort>[] = [
+  { value: "total", label: "Total size", naturalDir: "desc" },
+  { value: "files", label: "Number of files", naturalDir: "desc" },
+  { value: "closeness", label: "Closeness", naturalDir: "asc" },
+  { value: "name", label: "Name", naturalDir: "asc" },
+];
 
 export default function SimilarImagesView({
   scanMode,
@@ -98,8 +145,12 @@ export default function SimilarImagesView({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // Which set is asking to be trashed whole. One at a time, so a second press
+  // moves the question rather than leaving two open.
+  const [confirmSet, setConfirmSet] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
+  const [skipped, setSkipped] = useState<Skipped | null>(null);
   const [stopped, setStopped] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -109,6 +160,7 @@ export default function SimilarImagesView({
   // a set is a set of identical files. Look-alikes differ in size on purpose,
   // and hiding the small one hides the answer.
   const filter = useGroupFilter(groups, pathsOf);
+  const sort = useSort<ImageSort>("similar-images", IMAGE_SORTS, "total");
   const files = useFileActions();
   const gone = (path: string) =>
     loaded != null && isMissing(loaded.checked, path);
@@ -137,6 +189,7 @@ export default function SimilarImagesView({
     setPage(0);
     setError("");
     setDone("");
+    setSkipped(null);
     setSaved("");
     const sel: Record<string, Set<string>> = {};
     for (const g of next)
@@ -147,9 +200,11 @@ export default function SimilarImagesView({
     onAdopted();
   }, [incoming, onAdopted]);
 
+  // Filtering and reordering both change what every page holds, so the reader
+  // lands back on the first page rather than on a page that no longer exists.
   useEffect(() => {
     setPage(0);
-  }, [filter.query, filter.ext]);
+  }, [filter.query, filter.ext, sort.key, sort.dir]);
 
   async function chooseFolder() {
     const dir = await pickFolder();
@@ -163,6 +218,7 @@ export default function SimilarImagesView({
     }
     setError("");
     setDone("");
+    setSkipped(null);
     setSaved("");
     setSaveError("");
     setStopped(false);
@@ -253,22 +309,96 @@ export default function SimilarImagesView({
     return { count, invalid, hidden };
   }, [groups, selection, filter.shows, loaded]);
 
-  const listed = filter.filtered?.length ?? 0;
+  // Ordering runs over the filtered sets and before the page is cut out of
+  // them, or turning to page 2 would show whatever the old order left there.
+  // Sorting by name uses the shortest path, the copy the defaults keep.
+  const ordered = useMemo(() => {
+    if (!filter.filtered) return null;
+    return sorted(
+      filter.filtered,
+      (g) =>
+        sort.key === "total"
+          ? g.files.reduce((s, f) => s + f.size, 0)
+          : sort.key === "files"
+            ? g.files.length
+            : sort.key === "closeness"
+              ? g.distance
+              : baseName(shortestPath(pathsOf(g))),
+      sort.dir,
+    );
+  }, [filter.filtered, sort.key, sort.dir]);
+
+  const listed = ordered?.length ?? 0;
   const pages = Math.max(1, Math.ceil(listed / PER_PAGE));
   const from = page * PER_PAGE;
-  const shown = filter.filtered
-    ? filter.filtered.slice(from, from + PER_PAGE)
-    : [];
+  const shown = ordered ? ordered.slice(from, from + PER_PAGE) : [];
   // Only the sets on this page. Nothing off screen is ever requested, and what
   // has already arrived is served from the module cache when paging back.
   const thumb = useThumbs(
     shown.flatMap((g) => g.files.map((f) => f.path)),
     LARGE_PX,
   );
+  // The skipped note belongs next to the button that was pressed, but a set can
+  // fall out of the list and the footer only exists while something is ticked.
+  // When its own spot is gone the note moves up to the page rather than with it.
+  const skippedInline =
+    skipped != null &&
+    (skipped.from === null
+      ? summary.count > 0
+      : shown.some((g) => keyOf(g) === skipped.from));
 
   function goPage(next: number) {
     setPage(next);
     listRef.current?.scrollIntoView({ block: "start" });
+  }
+
+  // Shared by the footer and by the per-set button. Both trash a list of paths
+  // and then rebuild the results in place, never by re-scanning: a set left
+  // holding one photo has nothing left to compare, so it drops out entirely.
+  // Only what the backend says it moved leaves the screen. A skipped photo is
+  // still sitting on disk, so it stays listed, stays ticked, and says why, and
+  // the message is written from moved rather than from what was asked for.
+  // Throws on failure so the caller can report it where it was pressed.
+  async function removePaths(
+    paths: string[],
+    from: string | null,
+    message: (moved: string[]) => string,
+  ) {
+    const res = await invoke<TrashOutcome>("trash_files", {
+      paths,
+      reason: "dedup",
+    });
+    const removed = new Set(res.moved);
+    // A set is keyed by the paths it holds, so losing one re-keys it. The
+    // selection and the open note both have to follow the set to its new key.
+    let at = from;
+    const remaining: SimilarGroup[] = [];
+    const sel: Record<string, Set<string>> = {};
+    for (const g of groups ?? []) {
+      const next = { ...g, files: g.files.filter((f) => !removed.has(f.path)) };
+      if (next.files.length < 2) continue;
+      remaining.push(next);
+      // Every set the user did not act on keeps exactly the boxes they left,
+      // including the ones they cleared on purpose. Rebuilding the defaults
+      // here would re-tick photos they had decided to keep.
+      const had = selection[keyOf(g)];
+      sel[keyOf(next)] = had
+        ? new Set([...had].filter((p) => !removed.has(p)))
+        : defaultRemoval(pathsOf(next), gone);
+      if (at === keyOf(g)) at = keyOf(next);
+    }
+    setGroups(remaining);
+    setSelection(sel);
+    setPage((p) =>
+      Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
+    );
+    setConfirming(false);
+    setConfirmSet(null);
+    setError("");
+    setSkipped(
+      res.skipped.length > 0 ? { from: at, items: res.skipped } : null,
+    );
+    setDone(res.moved.length > 0 ? message(res.moved) : "");
   }
 
   async function trashSelected() {
@@ -277,25 +407,11 @@ export default function SimilarImagesView({
       for (const p of selection[keyOf(g)] ?? []) paths.push(p);
     if (paths.length === 0) return;
     try {
-      await invoke<string>("trash_files", { paths, reason: "dedup" });
-      const removed = new Set(paths);
-      const remaining = (groups ?? [])
-        .map((g) => ({
-          ...g,
-          files: g.files.filter((f) => !removed.has(f.path)),
-        }))
-        .filter((g) => g.files.length > 1);
-      setGroups(remaining);
-      const sel: Record<string, Set<string>> = {};
-      for (const g of remaining)
-        sel[keyOf(g)] = defaultRemoval(pathsOf(g), gone);
-      setSelection(sel);
-      setPage((p) =>
-        Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
-      );
-      setConfirming(false);
-      setDone(
-        `Moved ${paths.length} ${paths.length === 1 ? "photo" : "photos"} to Trash. Restore anytime from Trash.`,
+      await removePaths(
+        paths,
+        null,
+        (moved) =>
+          `Moved ${moved.length} ${moved.length === 1 ? SET_NOUN.one : SET_NOUN.many} to Trash. Restore anytime from Trash.`,
       );
     } catch (e) {
       setError(`Could not move files: ${errorText(e)}`);
@@ -392,6 +508,7 @@ export default function SimilarImagesView({
           <span>{done}</span>
         </div>
       )}
+      {skipped && !skippedInline && <SkippedNote items={skipped.items} />}
 
       {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
@@ -432,7 +549,12 @@ export default function SimilarImagesView({
             )}
           </div>
 
-          <ResultFilters filter={filter} unit="sets" />
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="min-w-0 flex-1 basis-80">
+              <ResultFilters filter={filter} unit="sets" />
+            </div>
+            <SortPicker sort={sort} />
+          </div>
 
           {listed === 0 ? (
             <NoFilterMatch filter={filter} unit="sets" />
@@ -453,8 +575,19 @@ export default function SimilarImagesView({
               <div ref={listRef} className="space-y-4">
                 {shown.map((g) => {
                   const sel = selection[keyOf(g)] ?? new Set<string>();
-                  const missing = g.files.filter((f) => gone(f.path)).length;
+                  // A path a snapshot says is gone cannot be trashed, so the
+                  // whole set button offers only what is still on disk.
+                  const live = g.files
+                    .filter((f) => !gone(f.path))
+                    .map((f) => f.path);
+                  const missing = g.files.length - live.length;
                   const keeping = g.files.length - sel.size - missing;
+                  // A changed photo is still a real file the user may want
+                  // gone, so it stays on offer. The confirm just cannot present
+                  // it as the picture the scan compared.
+                  const changed = loaded
+                    ? live.filter((p) => isChanged(loaded.checked, p)).length
+                    : 0;
                   return (
                     <div
                       key={keyOf(g)}
@@ -482,16 +615,48 @@ export default function SimilarImagesView({
                             </div>
                           </div>
                         </div>
-                        <div className="text-right text-xs text-ink-soft">
-                          Keep{" "}
-                          <span className="font-semibold text-ink">
-                            {keeping}
-                          </span>
-                          , remove{" "}
-                          <span className="font-semibold text-brick">
-                            {sel.size}
-                          </span>
+                        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2">
+                          <div className="text-right text-xs text-ink-soft">
+                            Keep{" "}
+                            <span className="font-semibold text-ink">
+                              {keeping}
+                            </span>
+                            , remove{" "}
+                            <span className="font-semibold text-brick">
+                              {sel.size}
+                            </span>
+                          </div>
+                          {live.length > 0 && (
+                            <TrashSetButton
+                              paths={live}
+                              noun={SET_NOUN.one}
+                              nounPlural={SET_NOUN.many}
+                              note={
+                                "These matched on how they look, not on an exact copy check, so they may not be the same picture." +
+                                (changed > 0
+                                  ? ` ${changed} of ${changed === 1 ? "them has" : "them have"} also changed on disk since this list was saved.`
+                                  : "")
+                              }
+                              open={confirmSet === keyOf(g)}
+                              onOpen={(open) =>
+                                setConfirmSet(open ? keyOf(g) : null)
+                              }
+                              onTrash={(paths) =>
+                                removePaths(
+                                  paths,
+                                  keyOf(g),
+                                  (moved) =>
+                                    `Moved ${moved.length} ${moved.length === 1 ? SET_NOUN.one : SET_NOUN.many} from that set to Trash. Restore anytime from Trash.`,
+                                )
+                              }
+                            />
+                          )}
                         </div>
+                        {skipped && skipped.from === keyOf(g) && (
+                          <div className="basis-full">
+                            <SkippedNote items={skipped.items} />
+                          </div>
+                        )}
                       </div>
                       {/* 140px keeps two copies side by side at 360px wide,
                           which is the whole point of laying them out as a
@@ -535,7 +700,12 @@ export default function SimilarImagesView({
       )}
 
       {summary.count > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:left-56">
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface px-4 py-3 md:left-56">
+          {skipped && skipped.from === null && (
+            <div className="mx-auto mb-3 max-w-3xl">
+              <SkippedNote items={skipped.items} />
+            </div>
+          )}
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
             {confirming ? (
               <>
@@ -543,6 +713,19 @@ export default function SimilarImagesView({
                   Move {summary.count}{" "}
                   {summary.count === 1 ? "photo" : "photos"} to Trash? You can
                   restore them later.
+                  {/* Ticking every box in a set is allowed, but it is the one
+                      case that leaves no photo behind, so it is said out loud
+                      before the files move. */}
+                  {summary.invalid > 0 && (
+                    <>
+                      {" "}
+                      <span className="text-ochre">
+                        {summary.invalid}{" "}
+                        {summary.invalid === 1 ? "set" : "sets"} would be
+                        emptied completely, keeping no photo on disk.
+                      </span>
+                    </>
+                  )}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -585,7 +768,7 @@ export default function SimilarImagesView({
                     </>
                   )}
                   {summary.invalid > 0 && (
-                    <span className="text-brick">
+                    <span className="text-ochre">
                       {" "}
                       · {summary.invalid} set{summary.invalid === 1 ? "" : "s"}{" "}
                       would keep no copy
@@ -595,8 +778,7 @@ export default function SimilarImagesView({
                 <button
                   type="button"
                   onClick={() => setConfirming(true)}
-                  disabled={summary.invalid > 0}
-                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   Move selected to Trash
                 </button>

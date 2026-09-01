@@ -1,10 +1,28 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "../bridge";
 import { formatRelative, formatSize } from "../format";
-import type { RootStatus, StorageStats } from "../types";
+import type { RootStatus, StorageStats, TrashOutcome } from "../types";
 import PageHeader from "../components/PageHeader";
 import RevealButton from "../components/FileActions";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import { IconCheck, IconRestore, IconTrash } from "../components/icons";
+
+type ExtSort = "size" | "count" | "ext";
+
+const EXT_SORTS: SortOption<ExtSort>[] = [
+  { value: "size", label: "Total size", naturalDir: "desc" },
+  { value: "count", label: "File count", naturalDir: "desc" },
+  { value: "ext", label: "Extension", naturalDir: "asc" },
+];
+
+type BigSort = "size" | "name" | "modified";
+
+const BIG_SORTS: SortOption<BigSort>[] = [
+  { value: "size", label: "Size", naturalDir: "desc" },
+  { value: "name", label: "Name", naturalDir: "asc" },
+  { value: "modified", label: "Date modified", naturalDir: "desc" },
+];
 
 export default function InsightsView() {
   const [stats, setStats] = useState<StorageStats | null>(null);
@@ -12,6 +30,9 @@ export default function InsightsView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [outcome, setOutcome] = useState<TrashOutcome | null>(null);
+  const extSort = useSort<ExtSort>("insights-ext", EXT_SORTS, "size");
+  const bigSort = useSort<BigSort>("insights-largest", BIG_SORTS, "size");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -84,15 +105,55 @@ export default function InsightsView() {
     const paths = [...selected];
     if (paths.length === 0) return;
     try {
-      await invoke<string>("trash_files", { paths, reason: "manual" });
-      setSelected(new Set());
-      await load();
+      const res = await invoke<TrashOutcome>("trash_files", {
+        paths,
+        reason: "manual",
+      });
+      setOutcome(res);
+      // Only what reached the quarantine leaves the selection. A skipped file is
+      // still on disk taking up the same space, so it stays listed and ticked.
+      const moved = new Set(res.moved);
+      setSelected((prev) => new Set([...prev].filter((p) => !moved.has(p))));
+      if (res.moved.length > 0) await load();
     } catch (e) {
       setError(
         `Could not move files: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
+
+  // Both lists arrive already cut to a top N by the backend, so reordering only
+  // shuffles what is on screen and never brings a new row into it. A file the
+  // index has no timestamp for sorts as the oldest, which keeps the unknowns
+  // together at one end rather than spread through real dates.
+  const byExt = useMemo(
+    () =>
+      sorted(
+        stats?.by_ext ?? [],
+        (e) =>
+          extSort.key === "size"
+            ? e.total_size
+            : extSort.key === "count"
+              ? e.count
+              : e.ext,
+        extSort.dir,
+      ),
+    [stats, extSort.key, extSort.dir],
+  );
+  const largest = useMemo(
+    () =>
+      sorted(
+        stats?.largest ?? [],
+        (h) =>
+          bigSort.key === "size"
+            ? h.size
+            : bigSort.key === "name"
+              ? h.name
+              : (h.modified_ns ?? 0),
+        bigSort.dir,
+      ),
+    [stats, bigSort.key, bigSort.dir],
+  );
 
   const empty = stats !== null && stats.files === 0;
   const maxExt =
@@ -105,7 +166,11 @@ export default function InsightsView() {
   const [heroNum, heroUnit] = formatSize(stats?.total_size ?? 0).split(" ");
 
   return (
-    <div className={"space-y-7" + (selected.size > 0 ? " pb-24" : "")}>
+    <div
+      className={
+        "space-y-7" + (outcome ? " pb-64" : selected.size > 0 ? " pb-24" : "")
+      }
+    >
       <PageHeader
         title="Insights"
         subtitle="See what is taking up space across every folder you have indexed."
@@ -189,9 +254,12 @@ export default function InsightsView() {
               <h2 className="text-[15px] font-semibold tracking-tight text-ink">
                 Size by type
               </h2>
-              <p className="text-xs text-ink-soft">
-                Top {stats.by_ext.length} extensions by space used
-              </p>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                <p className="text-xs text-ink-soft">
+                  Top {stats.by_ext.length} extensions by space used
+                </p>
+                <SortPicker sort={extSort} />
+              </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-line bg-surface">
               <div className="grid grid-cols-[2.75rem_1fr_4.25rem] items-center gap-x-3 border-b border-line px-4 py-2 text-xs text-ink-faint sm:grid-cols-[2.75rem_1fr_4.25rem_4rem]">
@@ -200,7 +268,7 @@ export default function InsightsView() {
                 <span className="text-right">Size</span>
                 <span className="hidden text-right sm:block">Files</span>
               </div>
-              {stats.by_ext.map((e) => {
+              {byExt.map((e) => {
                 const share = Math.round(
                   (e.total_size / stats.total_size) * 100,
                 );
@@ -237,15 +305,18 @@ export default function InsightsView() {
               <h2 className="text-[15px] font-semibold tracking-tight text-ink">
                 Biggest files
               </h2>
-              <p className="text-xs text-ink-soft">
-                <span className="font-mono text-ink">
-                  {formatSize(largestSum)}
-                </span>{" "}
-                in {stats.largest.length} files
-              </p>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                <p className="text-xs text-ink-soft">
+                  <span className="font-mono text-ink">
+                    {formatSize(largestSum)}
+                  </span>{" "}
+                  in {stats.largest.length} files
+                </p>
+                <SortPicker sort={bigSort} />
+              </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-line bg-surface">
-              {stats.largest.map((h) => {
+              {largest.map((h) => {
                 const isSel = selected.has(h.path);
                 return (
                   <div
@@ -301,31 +372,87 @@ export default function InsightsView() {
         </>
       )}
 
-      {selected.size > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:left-56">
-          <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-            <span className="text-sm text-ink-soft">
-              <span className="font-semibold text-ink">{selected.size}</span>{" "}
-              {selected.size === 1 ? "file" : "files"} selected
-            </span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
-              >
-                Clear
-              </button>
-              <button
-                type="button"
-                onClick={trashSelected}
-                className="inline-flex items-center gap-2 rounded-md bg-brick px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-              >
-                <IconTrash className="h-4 w-4" />
-                Move {selected.size} to Trash
-              </button>
+      {/* The outcome rides with the selection bar rather than the top of the
+          page, because the button that caused it is down here. */}
+      {(outcome || selected.size > 0) && (
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface md:left-56">
+          {outcome && (
+            <div
+              className={
+                "border-b px-4 py-3 " +
+                (outcome.moved.length === 0
+                  ? "border-brick/40 bg-brick-soft"
+                  : outcome.skipped.length > 0
+                    ? "border-ochre/40 bg-ochre-soft"
+                    : "border-teal-line bg-teal-soft")
+              }
+            >
+              <div className="mx-auto max-w-3xl">
+                <div className="flex items-start justify-between gap-3">
+                  <p
+                    className={
+                      "text-sm " +
+                      (outcome.moved.length === 0
+                        ? "text-brick"
+                        : outcome.skipped.length > 0
+                          ? "text-ochre"
+                          : "text-teal")
+                    }
+                  >
+                    {outcome.moved.length === 0
+                      ? `Nothing was moved, so no space was freed. ${outcome.skipped.length} ${outcome.skipped.length === 1 ? "file is" : "files are"} still on your disk.`
+                      : outcome.skipped.length > 0
+                        ? `Moved ${outcome.moved.length} ${outcome.moved.length === 1 ? "file" : "files"} to Trash. ${outcome.skipped.length} stayed put and ${outcome.skipped.length === 1 ? "is" : "are"} still selected, so you can try again.`
+                        : `Moved ${outcome.moved.length} ${outcome.moved.length === 1 ? "file" : "files"} to Trash.`}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setOutcome(null)}
+                    className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-ink-soft transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+                {outcome.skipped.length > 0 && (
+                  <ul className="mt-2 max-h-28 space-y-1.5 overflow-auto">
+                    {outcome.skipped.map((s) => (
+                      <li key={s.path} className="text-xs">
+                        <span className="block truncate font-mono text-ink">
+                          {s.path}
+                        </span>
+                        <span className="block text-ink-soft">{s.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </div>
-          </div>
+          )}
+          {selected.size > 0 && (
+            <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+              <span className="text-sm text-ink-soft">
+                <span className="font-semibold text-ink">{selected.size}</span>{" "}
+                {selected.size === 1 ? "file" : "files"} selected
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set())}
+                  className="rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={trashSelected}
+                  className="inline-flex items-center gap-2 rounded-md bg-brick px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                >
+                  <IconTrash className="h-4 w-4" />
+                  Move {selected.size} to Trash
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

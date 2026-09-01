@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import { formatSize } from "../format";
+import { baseName, shortestPath } from "../paths";
 import { useDupMinMb, useScanMode } from "../store";
 import { SMALL_PX, isImage, useThumbs } from "../thumbs";
 import {
@@ -17,6 +18,8 @@ import type {
   HashAlgo,
   Progress,
   ScanMode,
+  SkippedItem,
+  TrashOutcome,
 } from "../types";
 import { ContentCoverageNote } from "../components/CoverageNote";
 import PageHeader from "../components/PageHeader";
@@ -40,8 +43,11 @@ import ResultFilters, {
 import ScanModePicker from "../components/ScanModePicker";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import Stack from "../components/Stack";
 import StoppedNotice from "../components/StoppedNotice";
+import TrashSetButton from "../components/TrashSetButton";
 import SimilarImagesView from "./SimilarImagesView";
 import SimilarNamesView from "./SimilarNamesView";
 import { IconCheck, IconChevron, IconFolder } from "../components/icons";
@@ -139,6 +145,7 @@ export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
       )}
       {mode === "names" && (
         <SimilarNamesView
+          algo={algo}
           scanMode={scanMode}
           onScanMode={setScanMode}
           onExact={() => setMode("exact")}
@@ -153,10 +160,40 @@ export default function DuplicatesView({ algo }: { algo: HashAlgo }) {
 // the list is paged while the selection stays whole underneath it.
 const PER_PAGE = 25;
 
-function shortestPath(paths: string[]): string {
-  return [...paths].sort(
-    (a, b) => a.length - b.length || a.localeCompare(b),
-  )[0];
+// The word for one file in a set, in one place: the set button asks about
+// copies and the message it leaves behind has to say the same word.
+const SET_NOUN = { one: "copy", many: "copies" };
+
+// Where a partial trash gets reported. from is the hash of the set whose own
+// button was pressed, or null for the footer, so the note lands where the press
+// happened rather than at the top of a page the reader has scrolled past.
+type Skipped = { from: string | null; items: SkippedItem[] };
+
+// What trash_files refused to move, in the words the backend already wrote.
+// Reasons are shown verbatim: they name the drive, the free space, or the OS
+// error, and any summary of that is a worse answer than the answer.
+function SkippedNote({ items }: { items: SkippedItem[] }) {
+  return (
+    <div className="rounded-md border border-ochre/40 bg-ochre-soft px-3.5 py-2.5 text-left text-sm text-ochre">
+      <p className="font-medium">
+        {items.length} {items.length === 1 ? "file is" : "files are"} still on
+        disk and {items.length === 1 ? "was" : "were"} not moved
+      </p>
+      {/* Every path is listed, but a whole disconnected drive can be a hundred
+          of them and this note sits in a fixed footer, so the list scrolls
+          instead of pushing the buttons off the screen. */}
+      <ul className="mt-1.5 max-h-40 space-y-1.5 overflow-y-auto">
+        {items.map((s) => (
+          <li key={s.path}>
+            <span className="block truncate font-mono text-xs" title={s.path}>
+              {s.path}
+            </span>
+            <span className="block text-xs">{s.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 // Selected == the copies to remove. Default keeps the shortest path still on
@@ -189,6 +226,17 @@ function sizesOf(g: DupGroup): number[] {
 function keepOnly(g: DupGroup, paths: Set<string>): DupGroup {
   return { ...g, paths: g.paths.filter((p) => paths.has(p)) };
 }
+
+type DupSort = "wasted" | "size" | "copies" | "name";
+
+// Wasted space first, which is the order this list has always shipped in and
+// the reason most people open it.
+const DUP_SORTS: SortOption<DupSort>[] = [
+  { value: "wasted", label: "Wasted space", naturalDir: "desc" },
+  { value: "size", label: "File size", naturalDir: "desc" },
+  { value: "copies", label: "Number of copies", naturalDir: "desc" },
+  { value: "name", label: "Name", naturalDir: "asc" },
+];
 
 // Anything outside /Volumes sits on the drive the system booted from. Used only
 // to tell the reader when one set straddles two disks.
@@ -245,8 +293,12 @@ function ExactDuplicates({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // Which set is asking to be trashed whole. One at a time, so a second press
+  // moves the question rather than leaving two open.
+  const [confirmSet, setConfirmSet] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [done, setDone] = useState("");
+  const [skipped, setSkipped] = useState<Skipped | null>(null);
   const [stopped, setStopped] = useState(false);
   const [coverage, setCoverage] = useState<Coverage | null>(null);
   const [snapshot, setSnapshot] = useState<LoadedSnapshot | null>(null);
@@ -255,6 +307,7 @@ function ExactDuplicates({
   const [saved, setSaved] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const filter = useGroupFilter(groups, pathsOf, sizesOf, keepOnly);
+  const sort = useSort<DupSort>("duplicates", DUP_SORTS, "wasted");
   const files = useFileActions();
   const gone = (path: string) =>
     snapshot != null && isMissing(snapshot.checked, path);
@@ -267,10 +320,11 @@ function ExactDuplicates({
   }
 
   // Filtering is a view over the same results, so the reader lands back on the
-  // first page of what is left rather than on an empty page 7.
+  // first page of what is left rather than on an empty page 7. Reordering
+  // changes what every page holds, so it goes back to the first one too.
   useEffect(() => {
     setPage(0);
-  }, [filter.query, filter.ext, filter.minMb]);
+  }, [filter.query, filter.ext, filter.minMb, sort.key, sort.dir]);
 
   useEffect(() => {
     const un = listen<Progress>("dedup:progress", (p) => setProgress(p));
@@ -309,6 +363,7 @@ function ExactDuplicates({
     setPage(0);
     setError("");
     setDone("");
+    setSkipped(null);
     setSaved("");
     const sel: Record<string, Set<string>> = {};
     for (const g of next)
@@ -335,6 +390,7 @@ function ExactDuplicates({
     }
     setError("");
     setDone("");
+    setSkipped(null);
     setSaved("");
     setSaveError("");
     setStopped(false);
@@ -444,44 +500,103 @@ function ExactDuplicates({
     [groups],
   );
 
+  // Ordering runs over the filtered sets and before the page is cut out of
+  // them, or turning to page 2 would show whatever the old order left there.
+  // Sorting by name uses the shortest path, the copy the defaults keep.
+  const ordered = useMemo(() => {
+    if (!filter.filtered) return null;
+    return sorted(
+      filter.filtered,
+      (g) =>
+        sort.key === "wasted"
+          ? g.size * (g.paths.length - 1)
+          : sort.key === "size"
+            ? g.size
+            : sort.key === "copies"
+              ? g.paths.length
+              : baseName(shortestPath(g.paths)),
+      sort.dir,
+    );
+  }, [filter.filtered, sort.key, sort.dir]);
+
   const nothingIndexed = roots !== null && roots.length === 0;
   const loaded = groups?.length ?? 0;
-  const listed = filter.filtered?.length ?? 0;
+  const listed = ordered?.length ?? 0;
   const pages = Math.max(1, Math.ceil(listed / PER_PAGE));
   const from = page * PER_PAGE;
-  const shown = filter.filtered
-    ? filter.filtered.slice(from, from + PER_PAGE)
-    : [];
+  const shown = ordered ? ordered.slice(from, from + PER_PAGE) : [];
   // Only the sets on this page. Nothing off screen is ever requested, and what
   // has already arrived is served from the module cache when paging back.
   const thumb = useThumbs(
     shown.flatMap((g) => g.paths),
     SMALL_PX,
   );
+  // The skipped note belongs next to the button that was pressed, but a set can
+  // fall out of the list and the footer only exists while something is ticked.
+  // When its own spot is gone the note moves up to the page rather than with it.
+  const skippedInline =
+    skipped != null &&
+    (skipped.from === null
+      ? summary.count > 0
+      : shown.some((g) => g.hash === skipped.from));
+
+  // Shared by the footer and by the per-set button. Both trash a list of paths
+  // and then rebuild the results in place, never by re-scanning: a set left
+  // holding one file is no longer a duplicate set, so it drops out entirely.
+  // Only what the backend says it moved leaves the screen. A skipped file is
+  // still sitting on disk, so it stays listed, stays ticked, and says why, and
+  // the message is written from moved rather than from what was asked for.
+  // Throws on failure so the caller can report it where it was pressed.
+  async function removePaths(
+    paths: string[],
+    from: string | null,
+    message: (moved: string[]) => string,
+  ) {
+    const res = await invoke<TrashOutcome>("trash_files", {
+      paths,
+      reason: "dedup",
+    });
+    const removed = new Set(res.moved);
+    const remaining = (groups ?? [])
+      .map((g) => ({ ...g, paths: g.paths.filter((p) => !removed.has(p)) }))
+      .filter((g) => g.paths.length > 1);
+    setGroups(remaining);
+    setGroupCount(remaining.length);
+    setPage((p) =>
+      Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
+    );
+    // Every set the user did not act on keeps exactly the boxes they left,
+    // including the ones they cleared on purpose. Rebuilding the defaults here
+    // would re-tick copies they had decided to keep.
+    const sel: Record<string, Set<string>> = {};
+    for (const g of remaining) {
+      const had = selection[g.hash];
+      sel[g.hash] = had
+        ? new Set([...had].filter((p) => !removed.has(p)))
+        : defaultRemoval(g, gone);
+    }
+    setSelection(sel);
+    setConfirming(false);
+    setConfirmSet(null);
+    setError("");
+    setSkipped(res.skipped.length > 0 ? { from, items: res.skipped } : null);
+    setDone(res.moved.length > 0 ? message(res.moved) : "");
+  }
 
   async function trashSelected() {
     const paths: string[] = [];
+    const bytesOf = new Map<string, number>();
     for (const g of groups ?? [])
-      for (const p of selection[g.hash] ?? []) paths.push(p);
+      for (const p of selection[g.hash] ?? []) {
+        paths.push(p);
+        bytesOf.set(p, g.size);
+      }
     if (paths.length === 0) return;
     try {
-      await invoke<string>("trash_files", { paths, reason: "dedup" });
-      const removed = new Set(paths);
-      const remaining = (groups ?? [])
-        .map((g) => ({ ...g, paths: g.paths.filter((p) => !removed.has(p)) }))
-        .filter((g) => g.paths.length > 1);
-      setGroups(remaining);
-      setGroupCount(remaining.length);
-      setPage((p) =>
-        Math.min(p, Math.max(0, Math.ceil(remaining.length / PER_PAGE) - 1)),
-      );
-      const sel: Record<string, Set<string>> = {};
-      for (const g of remaining) sel[g.hash] = defaultRemoval(g, gone);
-      setSelection(sel);
-      setConfirming(false);
-      setDone(
-        `Moved ${paths.length} ${paths.length === 1 ? "file" : "files"} to Trash and reclaimed ${formatSize(summary.bytes)}. Restore anytime from Trash.`,
-      );
+      await removePaths(paths, null, (moved) => {
+        const bytes = moved.reduce((s, p) => s + (bytesOf.get(p) ?? 0), 0);
+        return `Moved ${moved.length} ${moved.length === 1 ? "file" : "files"} to Trash and reclaimed ${formatSize(bytes)}. Restore anytime from Trash.`;
+      });
     } catch (e) {
       setError(`Could not move files: ${errorText(e)}`);
       setConfirming(false);
@@ -673,6 +788,7 @@ function ExactDuplicates({
           <span>{done}</span>
         </div>
       )}
+      {skipped && !skippedInline && <SkippedNote items={skipped.items} />}
 
       {groups && groups.length === 0 && !done && !stopped && (
         <div className="rounded-lg border border-line bg-surface px-6 py-16 text-center">
@@ -722,7 +838,12 @@ function ExactDuplicates({
             </p>
           )}
 
-          <ResultFilters filter={filter} unit="sets" />
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="min-w-0 flex-1 basis-80">
+              <ResultFilters filter={filter} unit="sets" />
+            </div>
+            <SortPicker sort={sort} />
+          </div>
 
           {listed === 0 && <NoFilterMatch filter={filter} unit="sets" />}
 
@@ -741,8 +862,17 @@ function ExactDuplicates({
           <div ref={listRef} className="space-y-4">
             {shown.map((g) => {
               const sel = selection[g.hash] ?? new Set<string>();
-              const missing = g.paths.filter(gone).length;
+              // A path a snapshot says is gone cannot be trashed, so the whole
+              // set button offers only what is still on disk.
+              const live = g.paths.filter((p) => !gone(p));
+              const missing = g.paths.length - live.length;
               const keeping = g.paths.length - sel.size - missing;
+              // A changed copy is still a real file the user may want gone, so
+              // it stays on offer. It is no longer the file that was hashed
+              // though, and the confirm cannot claim these are identical.
+              const changed = snapshot
+                ? live.filter((p) => isChanged(snapshot.checked, p)).length
+                : 0;
               const drives = new Set(g.paths.map(driveOf)).size;
               // Every copy in a set is the same file, so one image copy means
               // the whole set gets the preview column and the rows stay lined
@@ -778,21 +908,50 @@ function ExactDuplicates({
                         </div>
                       </div>
                     </div>
-                    <div className="text-right text-xs">
-                      <div className="text-ink-soft">
-                        Keep{" "}
-                        <span className="font-semibold text-ink">
-                          {keeping}
-                        </span>
-                        , remove{" "}
-                        <span className="font-semibold text-brick">
-                          {sel.size}
-                        </span>
+                    <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2">
+                      <div className="text-right text-xs">
+                        <div className="text-ink-soft">
+                          Keep{" "}
+                          <span className="font-semibold text-ink">
+                            {keeping}
+                          </span>
+                          , remove{" "}
+                          <span className="font-semibold text-brick">
+                            {sel.size}
+                          </span>
+                        </div>
+                        <div className="font-mono text-ochre">
+                          frees {formatSize(g.size * (g.paths.length - 1))}
+                        </div>
                       </div>
-                      <div className="font-mono text-ochre">
-                        frees {formatSize(g.size * (g.paths.length - 1))}
-                      </div>
+                      {live.length > 0 && (
+                        <TrashSetButton
+                          paths={live}
+                          noun={SET_NOUN.one}
+                          nounPlural={SET_NOUN.many}
+                          note={
+                            changed > 0
+                              ? `${changed} of ${changed === 1 ? "them has" : "them have"} changed on disk since this list was saved, so ${changed === 1 ? "it is" : "they are"} no longer the file the scan compared.`
+                              : undefined
+                          }
+                          open={confirmSet === g.hash}
+                          onOpen={(open) => setConfirmSet(open ? g.hash : null)}
+                          onTrash={(paths) =>
+                            removePaths(
+                              paths,
+                              g.hash,
+                              (moved) =>
+                                `Moved ${moved.length} ${moved.length === 1 ? SET_NOUN.one : SET_NOUN.many} to Trash and reclaimed ${formatSize(g.size * moved.length)}. Restore anytime from Trash.`,
+                            )
+                          }
+                        />
+                      )}
                     </div>
+                    {skipped && skipped.from === g.hash && (
+                      <div className="basis-full">
+                        <SkippedNote items={skipped.items} />
+                      </div>
+                    )}
                   </div>
                   <ul>
                     {g.paths.map((p) => {
@@ -917,7 +1076,12 @@ function ExactDuplicates({
       )}
 
       {summary.count > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:left-56">
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface px-4 py-3 md:left-56">
+          {skipped && skipped.from === null && (
+            <div className="mx-auto mb-3 max-w-3xl">
+              <SkippedNote items={skipped.items} />
+            </div>
+          )}
           <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
             {confirming ? (
               <>
@@ -928,6 +1092,19 @@ function ExactDuplicates({
                     {formatSize(summary.bytes)}
                   </span>
                   ? You can restore them later.
+                  {/* Ticking every box in a set is allowed, but it is the one
+                      case that leaves no copy behind, so it is said out loud
+                      before the files move. */}
+                  {summary.invalid > 0 && (
+                    <>
+                      {" "}
+                      <span className="text-ochre">
+                        {summary.invalid}{" "}
+                        {summary.invalid === 1 ? "set" : "sets"} would be
+                        emptied completely, keeping no copy on disk.
+                      </span>
+                    </>
+                  )}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -984,7 +1161,7 @@ function ExactDuplicates({
                     </>
                   )}
                   {summary.invalid > 0 && (
-                    <span className="text-brick">
+                    <span className="text-ochre">
                       {" "}
                       · {summary.invalid} set{summary.invalid === 1 ? "" : "s"}{" "}
                       would keep no copy
@@ -994,8 +1171,7 @@ function ExactDuplicates({
                 <button
                   type="button"
                   onClick={() => setConfirming(true)}
-                  disabled={summary.invalid > 0}
-                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                  className="rounded-md bg-teal px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
                 >
                   Move selected to Trash
                 </button>

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { invoke } from "../bridge";
+import { invoke, isDesktop } from "../bridge";
 import ModelSelector from "../ModelSelector";
 import PageHeader from "../components/PageHeader";
 import Segmented from "../components/Segmented";
 import { IconCheck, IconKey, IconReveal } from "../components/icons";
 import { formatSize } from "../format";
+import { useUpdatePrefs } from "../store";
 import { forgetThumbs } from "../thumbs";
 import type {
   AppDataSummary,
@@ -45,6 +46,166 @@ function Row({
         <p className="mt-0.5 text-sm text-ink-soft">{desc}</p>
       </div>
       <div className="shrink-0">{children}</div>
+    </div>
+  );
+}
+
+// Anything under an hour hammers a manifest that only moves on release day.
+const UPDATE_INTERVALS = [
+  { min: 15, label: "Every 15 minutes" },
+  { min: 30, label: "Every 30 minutes" },
+  { min: 60, label: "Every hour" },
+  { min: 180, label: "Every 3 hours" },
+  { min: 360, label: "Every 6 hours" },
+  { min: 1440, label: "Once a day" },
+];
+
+function CheckOption({
+  label,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label
+      className={
+        "flex items-center gap-2 text-sm text-ink " +
+        (disabled ? "cursor-not-allowed" : "cursor-pointer")
+      }
+    >
+      <span
+        className={
+          "grid h-4 w-4 shrink-0 place-items-center rounded-[3px] border transition-colors " +
+          (checked
+            ? "border-teal bg-teal text-white"
+            : "border-line-strong bg-surface")
+        }
+      >
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.checked)}
+          aria-label={label}
+          className="sr-only"
+        />
+        {checked && <IconCheck className="h-3 w-3" />}
+      </span>
+      {label}
+    </label>
+  );
+}
+
+function UpdateControl() {
+  const {
+    autoUpdate,
+    setAutoUpdate,
+    updateOnStartup,
+    setUpdateOnStartup,
+    updateWhileRunning,
+    setUpdateWhileRunning,
+    updateIntervalMin,
+    setUpdateIntervalMin,
+  } = useUpdatePrefs();
+  const [version, setVersion] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    invoke<string>("app_version")
+      .then(setVersion)
+      .catch(() => setVersion(""));
+  }, []);
+
+  // The background check stays silent, but this one was asked for, so a failure
+  // says what went wrong instead of looking like nothing happened.
+  async function checkNow() {
+    setChecking(true);
+    setNote("");
+    setError("");
+    try {
+      if (!isDesktop) throw new Error("this only works in the desktop app");
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const found = await check();
+      setNote(
+        found
+          ? `Version ${found.version} is available.`
+          : "You are on the latest version.",
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <div className="w-full max-w-sm sm:w-80">
+      <Segmented<"on" | "off">
+        ariaLabel="Check for updates"
+        value={autoUpdate ? "on" : "off"}
+        onChange={(v) => setAutoUpdate(v === "on")}
+        options={[
+          { value: "on", label: "On" },
+          { value: "off", label: "Off" },
+        ]}
+      />
+      <div
+        className={
+          "mt-3 space-y-2.5 " + (autoUpdate ? "" : "opacity-50 select-none")
+        }
+      >
+        <CheckOption
+          label="When the app starts"
+          checked={updateOnStartup}
+          disabled={!autoUpdate}
+          onChange={setUpdateOnStartup}
+        />
+        <CheckOption
+          label="While the app is open"
+          checked={updateWhileRunning}
+          disabled={!autoUpdate}
+          onChange={setUpdateWhileRunning}
+        />
+        <select
+          value={String(updateIntervalMin)}
+          onChange={(e) => setUpdateIntervalMin(Number(e.target.value))}
+          disabled={!autoUpdate || !updateWhileRunning}
+          aria-label="How often to check for updates"
+          className="w-full rounded-md border border-line bg-surface px-2.5 py-1.5 text-sm text-ink outline-none focus:border-teal disabled:cursor-not-allowed disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-teal/30"
+        >
+          {UPDATE_INTERVALS.map((s) => (
+            <option key={s.min} value={s.min}>
+              {s.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <span className="font-mono text-xs tabular-nums text-ink-soft">
+          {version ? `Version ${version}` : "Reading version"}
+        </span>
+        <button
+          type="button"
+          onClick={checkNow}
+          disabled={checking}
+          className="shrink-0 rounded-md border border-line bg-surface px-2.5 py-1 text-xs font-medium text-ink hover:border-line-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+        >
+          {checking ? "Checking" : "Check now"}
+        </button>
+      </div>
+      {note && <p className="mt-2 text-xs text-ink-soft">{note}</p>}
+      {error && (
+        <p className="mt-2 text-xs text-brick">
+          The check did not finish: {error}
+        </p>
+      )}
     </div>
   );
 }
@@ -473,6 +634,14 @@ export default function SettingsView({
               { value: "system", label: "System" },
             ]}
           />
+        </Row>
+
+        <Row
+          top
+          title="Updates"
+          desc="Check GitHub for a new version. Nothing installs on its own: a new version shows up as a bar at the bottom that you can take or dismiss."
+        >
+          <UpdateControl />
         </Row>
 
         <Row

@@ -20,7 +20,9 @@ export default function TrashView() {
       setItems(await invoke<TrashItem[]>("list_trash", { limit: 500 }));
       setError("");
     } catch (e) {
-      setError(`Could not load Trash: ${e instanceof Error ? e.message : String(e)}`);
+      setError(
+        `Could not load Trash: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }, []);
 
@@ -102,15 +104,21 @@ export default function TrashView() {
             const bytes = op.items.reduce((s, i) => s + i.size, 0);
             const first = op.items[0];
             return (
-              <div key={op.op_id} className="rounded-lg border border-line bg-surface">
+              <div
+                key={op.op_id}
+                className="rounded-lg border border-line bg-surface"
+              >
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
                   <div className="min-w-0">
                     <div className="text-sm font-medium text-ink">
-                      {op.items.length} {op.items.length === 1 ? "file" : "files"}{" "}
-                      removed
+                      {op.items.length}{" "}
+                      {op.items.length === 1 ? "file" : "files"} removed
                       <span className="ml-2 text-xs font-normal text-ink-faint">
-                        {first.reason === "dedup" ? "from duplicates" : "manually"}{" "}
-                        · {formatRelative(first.deleted_ns)} · {formatSize(bytes)}
+                        {first.reason === "dedup"
+                          ? "from duplicates"
+                          : "manually"}{" "}
+                        · {formatRelative(first.deleted_ns)} ·{" "}
+                        {formatSize(bytes)}
                       </span>
                     </div>
                   </div>
@@ -147,7 +155,10 @@ export default function TrashView() {
                           type="button"
                           onClick={() =>
                             run(
-                              () => invoke<string[]>("restore_op", { opId: op.op_id }),
+                              () =>
+                                invoke<string[]>("restore_op", {
+                                  opId: op.op_id,
+                                }),
                               `Restored ${pending.length} ${pending.length === 1 ? "file" : "files"}.`,
                             )
                           }
@@ -209,7 +220,10 @@ export default function TrashView() {
                               onClick={() => {
                                 setConfirmItem(null);
                                 run(
-                                  () => invoke("purge_trash_item", { itemId: it.id }),
+                                  () =>
+                                    invoke("purge_trash_item", {
+                                      itemId: it.id,
+                                    }),
                                   "Deleted that file for good.",
                                 );
                               }}
@@ -238,7 +252,10 @@ export default function TrashView() {
                               type="button"
                               onClick={() =>
                                 run(
-                                  () => invoke<string>("restore_item", { itemId: it.id }),
+                                  () =>
+                                    invoke<string>("restore_item", {
+                                      itemId: it.id,
+                                    }),
                                   "File restored to its original folder.",
                                 )
                               }

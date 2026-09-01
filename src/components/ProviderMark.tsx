@@ -34,14 +34,24 @@ export default function ProviderMark({
     <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
       {isGemini && (
         <defs>
-          <linearGradient id={gid} x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+          <linearGradient
+            id={gid}
+            x1="0"
+            y1="0"
+            x2="24"
+            y2="24"
+            gradientUnits="userSpaceOnUse"
+          >
             <stop offset="0" stopColor="#4285f4" />
             <stop offset="0.5" stopColor="#9b72cb" />
             <stop offset="1" stopColor="#d96570" />
           </linearGradient>
         </defs>
       )}
-      <path fill={isGemini ? `url(#${gid})` : mark.color ?? "currentColor"} d={mark.path} />
+      <path
+        fill={isGemini ? `url(#${gid})` : (mark.color ?? "currentColor")}
+        d={mark.path}
+      />
     </svg>
   );
 }

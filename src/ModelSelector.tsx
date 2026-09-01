@@ -12,12 +12,14 @@ export default function ModelSelector({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const selected = MODELS.find((m) => m.id === value) ?? (MODELS[0] as ModelOption);
+  const selected =
+    MODELS.find((m) => m.id === value) ?? (MODELS[0] as ModelOption);
 
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node))
+        setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
@@ -38,7 +40,10 @@ export default function ModelSelector({
         </span>
         <svg
           viewBox="0 0 24 24"
-          className={"h-4 w-4 text-ink-faint transition-transform " + (open ? "rotate-180" : "")}
+          className={
+            "h-4 w-4 text-ink-faint transition-transform " +
+            (open ? "rotate-180" : "")
+          }
           fill="none"
           stroke="currentColor"
           strokeWidth={1.8}

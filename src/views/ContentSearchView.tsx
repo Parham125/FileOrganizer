@@ -1,9 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, pickFolder } from "../bridge";
 import type { ContentHit, IndexResult, Progress } from "../types";
 import ScanProgress from "../components/ScanProgress";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import StoppedNotice from "../components/StoppedNotice";
 import { IconCheck, IconFolder, IconSearch } from "../components/icons";
+
+// A content hit carries a path and a snippet and nothing else, so there is no
+// size or date to order by here.
+type HitSort = "name" | "folder";
+
+const HIT_SORTS: SortOption<HitSort>[] = [
+  { value: "name", label: "Name", naturalDir: "asc" },
+  { value: "folder", label: "Folder", naturalDir: "asc" },
+];
 
 // Snippets arrive with matched terms wrapped in square brackets, like
 // "the annual [budget] was". Render those spans emphasized and drop the
@@ -39,6 +50,7 @@ export default function ContentSearchView() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState("");
   const [stopped, setStopped] = useState("");
+  const sort = useSort<HitSort>("content-search", HIT_SORTS, "name");
 
   const queryRef = useRef(query);
   queryRef.current = query;
@@ -107,6 +119,27 @@ export default function ContentSearchView() {
   }
 
   const notIndexed = count == null;
+  const ordered = useMemo(
+    () =>
+      sorted(
+        hits,
+        (h) => {
+          // A path with no separator at all has no folder, and slicing to -1
+          // would quietly drop its last character instead.
+          const cut = Math.max(
+            h.path.lastIndexOf("/"),
+            h.path.lastIndexOf("\\"),
+          );
+          return sort.key === "name"
+            ? h.path.slice(cut + 1)
+            : cut < 0
+              ? ""
+              : h.path.slice(0, cut);
+        },
+        sort.dir,
+      ),
+    [hits, sort.key, sort.dir],
+  );
 
   return (
     <div className="space-y-6">
@@ -154,19 +187,22 @@ export default function ContentSearchView() {
         </div>
       )}
 
-      <div className="relative">
-        <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-ink-faint" />
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          disabled={notIndexed}
-          placeholder={
-            notIndexed
-              ? "Index a folder to search inside documents"
-              : "Search words inside your documents"
-          }
-          className="w-full rounded-md border border-line bg-surface py-2.5 pl-10 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 disabled:cursor-not-allowed disabled:opacity-60"
-        />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="relative min-w-0 flex-1 basis-64">
+          <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-ink-faint" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            disabled={notIndexed}
+            placeholder={
+              notIndexed
+                ? "Index a folder to search inside documents"
+                : "Search words inside your documents"
+            }
+            className="w-full rounded-md border border-line bg-surface py-2.5 pl-10 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-faint focus:border-teal focus-visible:ring-2 focus-visible:ring-teal/30 disabled:cursor-not-allowed disabled:opacity-60"
+          />
+        </div>
+        {hits.length > 1 && <SortPicker sort={sort} />}
       </div>
 
       <div className="overflow-hidden rounded-lg border border-line bg-surface">
@@ -195,9 +231,13 @@ export default function ContentSearchView() {
           </div>
         ) : (
           <ul>
-            {hits.map((h) => {
-              const name = h.path.slice(h.path.lastIndexOf("/") + 1);
-              const dir = h.path.slice(0, h.path.lastIndexOf("/"));
+            {ordered.map((h) => {
+              const cut = Math.max(
+                h.path.lastIndexOf("/"),
+                h.path.lastIndexOf("\\"),
+              );
+              const name = h.path.slice(cut + 1);
+              const dir = h.path.slice(0, cut);
               return (
                 <li
                   key={h.path}

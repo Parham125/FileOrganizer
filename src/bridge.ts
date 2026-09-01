@@ -1,12 +1,15 @@
 import type {
   AgentResult,
   AppDataSummary,
+  ApplyOrganization,
   Chat,
   ChatMessage,
   ChatSummary,
   ContentHit,
   DupGroup,
   DupScanResult,
+  ExactCheck,
+  ExactGroup,
   ExtStat,
   IndexResult,
   KeyStorage,
@@ -28,9 +31,11 @@ import type {
   SearchOpts,
   SimilarGroup,
   SimilarScanResult,
+  SkippedItem,
   StorageStats,
   Thumb,
   TrashItem,
+  TrashOutcome,
 } from "./types";
 
 // Single seam between the UI and the desktop runtime. Inside Tauri we delegate
@@ -389,6 +394,17 @@ function makeSimilarGroups(): SimilarGroup[] {
         f("/Users/you/Pictures/exports/harbour-burst-edit.jpg", 4_100_000, 8),
       ],
     },
+    // One set the trash cannot fully empty, so a partial move is drivable here
+    // the way it is in the other lists: the mock refuses an unreachable
+    // /Volumes path and anything named "locked".
+    {
+      distance: 3,
+      files: [
+        f("/Users/you/Pictures/2026/quarry-locked.jpg", 6_200_000, 44),
+        f("/Volumes/Archive/photos/quarry-012.jpg", 6_180_000, 44),
+        f("/Users/you/Pictures/exports/quarry-012.jpg", 3_050_000, 19),
+      ],
+    },
   ];
 }
 
@@ -675,6 +691,33 @@ function makeCopyGroups(): NameGroup[] {
       ext,
       year: null,
       all_same_size: files.every((f) => f.size === files[0].size),
+      files,
+    });
+  }
+  // Three sets that exist only so the exact check's awkward answers can be
+  // driven in the browser: the verify_exact_match mock reads "stop-here" as a
+  // cancelled run and "split-me" as a set that breaks into several identical
+  // groups, and a set living entirely on an absent drive comes back having
+  // compared nothing. Every one of these renders a non-verdict, which is the
+  // half of that feature nothing else in these fixtures reaches.
+  for (const [stem, folder] of [
+    ["stop-here-render", "/Users/you/Documents/Scans"],
+    ["split-me-render", "/Users/you/Downloads"],
+    ["offline-render", "/Volumes/Archive/scans"],
+  ]) {
+    const files = Array.from({ length: 4 }, (_, c) => ({
+      path: `${folder}/${stem}${c === 0 ? "" : ` (${c})`}.pdf`,
+      size: 512_000,
+      modified_ns: daysAgoNs(30 + c * 4),
+      marker: c === 0 ? null : `(${c})`,
+      stripped: [],
+    }));
+    groups.push({
+      strategy: "copies",
+      stem,
+      ext: "pdf",
+      year: null,
+      all_same_size: true,
       files,
     });
   }
@@ -1115,6 +1158,8 @@ function mockBridge(): Bridge {
   // The external drive in this mock is unplugged: its rows stay searchable, but
   // nothing under it can be opened or hashed.
   const reachable = (path: string) => !path.startsWith("/Volumes/");
+  // Mirrors VERIFY_CAP in src-tauri/src/lib.rs.
+  const VERIFY_CAP = 512;
   const trash: TrashItem[] = makeTrash();
   const opOrder: string[] = [...new Set(trash.map((t) => t.op_id))];
   const rules: Rule[] = makeRules();
@@ -1372,6 +1417,75 @@ function mockBridge(): Bridge {
             : roots.filter((r) => !reachable(r)),
         } as NameScanResult as T;
       }
+      case "verify_exact_match": {
+        // Every branch the UI has to render, drivable on purpose. Triggers, in
+        // the order they are checked:
+        //   no paths                      -> the empty-set error
+        //   more than 512 paths           -> the cap error
+        //   a path containing "stop-here" -> the cancelled shape, no verdict
+        //   every path under /Volumes     -> compared 0, all unreadable
+        //   a path containing "split-me"  -> more than one group
+        //   anything else                 -> a pair, a loner, and an unreachable
+        const asked = ((args.paths as string[]) ?? []).slice().sort();
+        if (asked.length === 0)
+          throw new Error("Nothing to verify: no files were passed.");
+        if (asked.length > VERIFY_CAP)
+          throw new Error(
+            `Too many files to verify at once: ${asked.length} paths, the limit is ${VERIFY_CAP}. Verify one group at a time.`,
+          );
+        await new Promise((r) => setTimeout(r, 700));
+        const sizeOf = (p: string) =>
+          files.find((f) => f.path === p)?.size ?? 4_812_907;
+        const unreadable = asked.filter((p) => !reachable(p));
+        const rest = asked.filter((p) => reachable(p));
+        if (asked.some((p) => p.includes("stop-here")))
+          return {
+            groups: [],
+            unique: [],
+            unreadable,
+            compared: 0,
+            bytes_hashed: 0,
+            cancelled: true,
+          } as ExactCheck as T;
+        const groups: ExactGroup[] = [];
+        let unique: string[] = [];
+        if (asked.some((p) => p.includes("split-me"))) {
+          // every reachable pair is its own group, an odd one out stays unique
+          for (let i = 0; i + 1 < rest.length; i += 2)
+            groups.push({
+              hash: "b3:" + rid() + rid(),
+              size: sizeOf(rest[i]),
+              paths: rest.slice(i, i + 2),
+            });
+          if (rest.length % 2 === 1) unique = [rest[rest.length - 1]];
+        } else {
+          const matched = rest.slice(0, 2);
+          unique = rest.slice(2);
+          if (matched.length > 1)
+            groups.push({
+              hash: "b3:" + rid() + rid(),
+              size: sizeOf(matched[0]),
+              paths: matched,
+            });
+          else if (matched.length === 1) unique.unshift(matched[0]);
+        }
+        return {
+          groups,
+          unique,
+          unreadable,
+          compared: rest.length,
+          // what a real run reads off the disk: the first and last 8 KiB of
+          // everything compared, plus the whole file for anything that made it
+          // to the full hash
+          bytes_hashed:
+            rest.reduce((n, p) => n + Math.min(sizeOf(p), 16_384), 0) +
+            groups.reduce(
+              (n, g) => n + g.paths.reduce((m, p) => m + sizeOf(p), 0),
+              0,
+            ),
+          cancelled: false,
+        } as ExactCheck as T;
+      }
       case "index_content": {
         const cancelled = await ramp("content:progress", 612, 2600);
         contentIndexed = cancelled ? 214 : 612;
@@ -1384,11 +1498,30 @@ function mockBridge(): Bridge {
         return makeContentHits(q).slice(0, limit) as T;
       }
       case "trash_files": {
+        // Partial failure is drivable on purpose. A path under /Volumes that is
+        // not reachable comes back as a disconnected drive, and any path whose
+        // name contains "locked" comes back as a permission wall. Everything
+        // else moves, and only what moved leaves the index.
         const paths = (args.paths as string[]) ?? [];
         const reason = String(args.reason ?? "manual");
         const op = "op_" + rid();
-        opOrder.unshift(op);
+        const moved: string[] = [];
+        const skipped: SkippedItem[] = [];
         for (const p of paths) {
+          if (!reachable(p)) {
+            skipped.push({
+              path: p,
+              reason: `${p.split("/").slice(0, 3).join("/")} is not reachable, the drive holding it may not be connected`,
+            });
+            continue;
+          }
+          if (p.toLowerCase().includes("locked")) {
+            skipped.push({
+              path: p,
+              reason: "could not be moved: Permission denied (os error 13)",
+            });
+            continue;
+          }
           const size =
             files.find((f) => f.path === p)?.size ??
             largest.find((f) => f.path === p)?.size ??
@@ -1404,10 +1537,12 @@ function mockBridge(): Bridge {
           });
           storedSize -= size;
           indexed -= 1;
+          moved.push(p);
         }
-        largest = largest.filter((f) => !paths.includes(f.path));
+        if (moved.length > 0) opOrder.unshift(op);
+        largest = largest.filter((f) => !moved.includes(f.path));
         emit("index:changed", undefined);
-        return op as T;
+        return { op_id: op, moved, skipped } as TrashOutcome as T;
       }
       case "list_trash": {
         const limit = (args.limit as number) ?? trash.length;
@@ -1557,6 +1692,7 @@ function mockBridge(): Bridge {
         return {
           op_id: hits.length > 0 ? op : "",
           count: hits.length,
+          skipped: [],
         } as RuleRun as T;
       }
       case "set_api_key":
@@ -1604,7 +1740,7 @@ function mockBridge(): Bridge {
           version: 1,
           kind: String(args.kind),
           created_ns: Date.now() * 1e6,
-          app_version: "0.10.0",
+          app_version: "0.10.3",
           scope: (args.scope as string | null) ?? null,
           note: (args.note as string | null) ?? null,
           payload: args.payload,
@@ -1620,7 +1756,7 @@ function mockBridge(): Bridge {
           version: 1,
           kind: "duplicates",
           created_ns: daysAgoNs(7),
-          app_version: "0.10.0",
+          app_version: "0.10.3",
           scope: null,
           note: "BLAKE3",
           payload: {
@@ -1702,10 +1838,29 @@ function mockBridge(): Bridge {
         return makeMoves(String(args.root ?? "/Users/you/Downloads")) as T;
       }
       case "ai_apply_organization": {
+        // Same skip triggers as trash_files, so an applied plan that half
+        // succeeded is drivable here too: an unreachable /Volumes source, or a
+        // name containing "locked".
+        const moves = (args.moves as Move[]) ?? [];
         const op = "op_" + rid();
-        opOrder.unshift(op);
+        const skipped: SkippedItem[] = [];
+        let moved = 0;
+        for (const m of moves) {
+          if (!reachable(m.from)) {
+            skipped.push({
+              path: m.from,
+              reason: `${m.from.split("/").slice(0, 3).join("/")} is not reachable, the drive holding it may not be connected`,
+            });
+          } else if (m.from.toLowerCase().includes("locked")) {
+            skipped.push({
+              path: m.from,
+              reason: "could not be moved: Permission denied (os error 13)",
+            });
+          } else moved += 1;
+        }
+        if (moved > 0) opOrder.unshift(op);
         emit("index:changed", undefined);
-        return op as T;
+        return { op_id: op, moved, skipped } as ApplyOrganization as T;
       }
       case "ai_agent": {
         if (!hasKey) throw new Error("No API key set");

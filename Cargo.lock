@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "fileorganizer"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "fo-ai",
@@ -1526,7 +1526,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fo-ai"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "fo-indexer",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "fo-archive"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "fo-chats"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "nanoid",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "fo-dedup"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "fo-hasher",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "fo-extract"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "pdf-extract",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "fo-hasher"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "fo-indexer"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "notify",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "fo-rules"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "fo-indexer",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "fo-search"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "fo-dedup",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "fo-thumbs"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "fo-trash"
-version = "0.10.1"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "libc",

@@ -24,6 +24,7 @@
 ## Install
 
 ### Windows
+
 Grab the latest installer from the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page:
 
 - **`FileOrganizer_x64-setup.exe`** (recommended), or
@@ -34,11 +35,13 @@ Grab the latest installer from the [**Releases**](https://github.com/Parham125/F
 Both are built from source by GitHub Actions on every release tag. The app is not code-signed, so SmartScreen warns on first run. Choose **More info -> Run anyway**.
 
 ### macOS
+
 Take **`FileOrganizer_universal.dmg`** from the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page. It is a universal build, so it runs natively on Apple Silicon and Intel.
 
 It is not signed or notarized, so Gatekeeper blocks it on first open: right-click the app and choose **Open**, or run `xattr -cr /Applications/FileOrganizer.app`. For the same reason the app cannot update itself on macOS (a freshly downloaded bundle is quarantined again, and Gatekeeper refuses it), so it tells you when a new version exists and links to the release instead. Windows and the Linux AppImage do update in place.
 
 ### Linux
+
 x86_64 builds are on the [**Releases**](https://github.com/Parham125/FileOrganizer/releases) page. Pick by distro:
 
 - **`.deb`** for Debian and Ubuntu

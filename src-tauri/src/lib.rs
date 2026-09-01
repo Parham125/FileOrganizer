@@ -3,8 +3,8 @@ use fo_ai::{OpenRouter, ReasoningEffort};
 use fo_archive::ArchiveListing;
 use fo_chats::{derive_title, Chat, ChatSummary, Chats};
 use fo_dedup::{
-    find_duplicates, find_similar_images, find_similar_names, DupGroup, NameGroup, NameStrategy,
-    ScanMode, SimilarGroup,
+    find_duplicates, find_similar_images, find_similar_names, verify_exact, DupGroup, ExactCheck,
+    NameGroup, NameStrategy, ScanMode, SimilarGroup,
 };
 use fo_hasher::HashAlgo;
 use fo_indexer::{ChangeEvent, FileEntry, FileSource, WalkdirSource, Watcher};
@@ -801,12 +801,70 @@ async fn scan_similar_names(
     .map_err(|e| e.to_string())?
 }
 
+/// How many paths one verify call will take. A name group is a handful of files;
+/// anything past this is a caller mistake, and saying so beats reading a whole
+/// drive one hash at a time.
+const VERIFY_CAP: usize = 512;
+
+/// Take one hand-picked set, usually a "Similar names" group, and answer whether
+/// those files are byte for byte the same. Runs the exact-duplicate staging
+/// (size, then a first+last 8 KiB partial hash, then a full hash) against the
+/// disk as it is now, not against the index.
+///
+/// The answer is not a boolean: a set can split into a matching pair plus a file
+/// that only shares the name, and files on a drive that is no longer plugged in
+/// come back in `unreadable`. `algo` and `mode` behave as in `scan_duplicates`.
+#[tauri::command]
+async fn verify_exact_match(
+    paths: Vec<String>,
+    algo: Option<String>,
+    mode: Option<String>,
+    app: AppHandle,
+) -> Result<ExactCheck, String> {
+    // An empty set has no answer in it, and a zero-everything ExactCheck reads
+    // like "compared them and found nothing", which is a different thing.
+    if paths.is_empty() {
+        return Err("Nothing to verify: no files were passed.".to_string());
+    }
+    if paths.len() > VERIFY_CAP {
+        return Err(format!(
+            "Too many files to verify at once: {} paths, the limit is {VERIFY_CAP}. Verify one group at a time.",
+            paths.len()
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let algo = match algo.as_deref() {
+            Some("sha256") => HashAlgo::Sha256,
+            _ => HashAlgo::Blake3,
+        };
+        let mode = ScanMode::from_label(mode.as_deref());
+        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+        let state = app.state::<AppState>();
+        let cancel = begin_scan(&state);
+        let check = verify_exact(&paths, algo, mode, &cancel);
+        end_scan(&state, &cancel);
+        Ok(check)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// What a trash request actually did. `moved` names the files that reached the
+/// quarantine and `skipped` every one that did not, with the reason, so the UI
+/// never reports a whole batch as gone when part of it is still on disk.
+#[derive(serde::Serialize)]
+struct TrashOutcome {
+    op_id: String,
+    moved: Vec<String>,
+    skipped: Vec<SkippedItem>,
+}
+
 #[tauri::command]
 fn trash_files(
     paths: Vec<String>,
     reason: String,
     state: State<AppState>,
-) -> Result<String, String> {
+) -> Result<TrashOutcome, String> {
     let bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let op = {
         let trash = state.trash.lock().unwrap();
@@ -814,12 +872,22 @@ fn trash_files(
             .trash_files(&bufs, &reason, None)
             .map_err(|e| e.to_string())?
     };
+    // Only what actually moved leaves the index. A skipped file is still on
+    // disk, and de-indexing it would drop it out of search and out of every
+    // later duplicate scan while it keeps every byte it had.
     let idx = state.index.lock().unwrap();
-    for p in &bufs {
-        let _ = idx.remove_path(p);
-        let _ = idx.remove_content(p);
+    let mut moved = Vec::with_capacity(op.items.len());
+    for it in &op.items {
+        let p = PathBuf::from(&it.original_path);
+        let _ = idx.remove_path(&p);
+        let _ = idx.remove_content(&p);
+        moved.push(it.original_path.clone());
     }
-    Ok(op.id)
+    Ok(TrashOutcome {
+        op_id: op.id,
+        moved,
+        skipped: op.skipped,
+    })
 }
 
 #[tauri::command]
@@ -1528,6 +1596,7 @@ pub fn run() {
             scan_duplicates_indexed,
             scan_similar_images,
             scan_similar_names,
+            verify_exact_match,
             cancel_scan,
             trash_files,
             list_trash,

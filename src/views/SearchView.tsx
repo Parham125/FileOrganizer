@@ -11,7 +11,13 @@ import {
   loadSnapshot,
 } from "../snapshot";
 import type { LoadedSnapshot, SearchPayload } from "../snapshot";
-import type { IndexResult, Progress, RootStatus, SearchHit } from "../types";
+import type {
+  IndexResult,
+  Progress,
+  RootStatus,
+  SearchHit,
+  TrashOutcome,
+} from "../types";
 import PageHeader from "../components/PageHeader";
 import ScanProgress from "../components/ScanProgress";
 import Segmented from "../components/Segmented";
@@ -22,6 +28,8 @@ import SnapshotBanner, {
   OpenSavedButton,
   SnapshotNote,
 } from "../components/SnapshotBanner";
+import SortPicker, { sorted, useSort } from "../components/SortPicker";
+import type { SortOption } from "../components/SortPicker";
 import StoppedNotice from "../components/StoppedNotice";
 import { ThumbSlot } from "../components/Thumb";
 import RevealButton from "../components/FileActions";
@@ -74,6 +82,15 @@ export default function SearchView({
   );
 }
 
+type HitSort = "name" | "size" | "modified" | "folder";
+
+const HIT_SORTS: SortOption<HitSort>[] = [
+  { value: "name", label: "Name", naturalDir: "asc" },
+  { value: "size", label: "Size", naturalDir: "desc" },
+  { value: "modified", label: "Date modified", naturalDir: "desc" },
+  { value: "folder", label: "Folder", naturalDir: "asc" },
+];
+
 const SIZE_PRESETS: { label: string; bytes: number | null }[] = [
   { label: "Any size", bytes: null },
   { label: "Over 1 MB", bytes: 1_048_576 },
@@ -103,6 +120,7 @@ function FilenameSearch({
   const [removing, setRemoving] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [outcome, setOutcome] = useState<TrashOutcome | null>(null);
   const [loaded, setLoaded] = useState<LoadedSnapshot | null>(null);
   const [snapHits, setSnapHits] = useState<SearchHit[]>([]);
   const [saving, setSaving] = useState(false);
@@ -110,6 +128,7 @@ function FilenameSearch({
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState("");
   const parentRef = useRef<HTMLDivElement>(null);
+  const sort = useSort<HitSort>("search", HIT_SORTS, "name");
 
   const stateRef = useRef({ query, ext, minIdx });
   stateRef.current = { query, ext, minIdx };
@@ -315,21 +334,57 @@ function FilenameSearch({
     const paths = [...selected];
     if (paths.length === 0) return;
     try {
-      await invoke<string>("trash_files", { paths, reason: "manual" });
-      setSelected(new Set());
+      const res = await invoke<TrashOutcome>("trash_files", {
+        paths,
+        reason: "manual",
+      });
+      setOutcome(res);
+      // Only what reached the quarantine leaves the list and the selection. A
+      // skipped file is still on disk, so it stays on screen and stays ticked
+      // for a retry.
+      const moved = new Set(res.moved);
+      setSelected((prev) => new Set([...prev].filter((p) => !moved.has(p))));
       // A saved list is not re-run, so the rows that just went are taken out of
       // it by hand rather than by searching again.
-      if (loaded) {
-        const removed = new Set(paths);
-        setSnapHits((prev) => prev.filter((h) => !removed.has(h.path)));
-      } else await runSearch();
+      if (loaded) setSnapHits((prev) => prev.filter((h) => !moved.has(h.path)));
+      else if (res.moved.length > 0) await runSearch();
     } catch (e) {
       setError(`Could not move files: ${errorText(e)}`);
     }
   }
 
+  // The virtualizer draws whatever this returns, so the sort has to land here
+  // and not on the rows it is fed from. A file the index has no timestamp for
+  // sorts as the oldest thing in the list: nulls group together at one end
+  // instead of scattering through real dates, and the row shows a blank date
+  // so the reader can see which ones they are.
+  const ordered = useMemo(
+    () =>
+      sorted(
+        rows,
+        (h) =>
+          sort.key === "name"
+            ? h.name
+            : sort.key === "size"
+              ? h.size
+              : sort.key === "modified"
+                ? (h.modified_ns ?? 0)
+                : // A path with no separator has no folder, and slicing to -1
+                  // would quietly drop its last character instead.
+                  h.path.slice(
+                    0,
+                    Math.max(
+                      0,
+                      h.path.lastIndexOf("/"),
+                      h.path.lastIndexOf("\\"),
+                    ),
+                  ),
+        sort.dir,
+      ),
+    [rows, sort.key, sort.dir],
+  );
   const rowVirtualizer = useVirtualizer({
-    count: rows.length,
+    count: ordered.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 58,
     overscan: 14,
@@ -338,7 +393,7 @@ function FilenameSearch({
   // Only the window the virtualizer is actually drawing, so scrolling a result
   // set of thousands never asks the drive for more than a screenful at a time.
   const thumb = useThumbs(
-    virtual.map((vi) => rows[vi.index]?.path ?? ""),
+    virtual.map((vi) => ordered[vi.index]?.path ?? ""),
     SMALL_PX,
   );
   // One image anywhere in the results reserves the column on every row, so a
@@ -347,7 +402,11 @@ function FilenameSearch({
   const offline = roots.filter((r) => !r.available).length;
 
   return (
-    <div className={"space-y-6" + (selected.size > 0 ? " pb-24" : "")}>
+    <div
+      className={
+        "space-y-6" + (outcome ? " pb-64" : selected.size > 0 ? " pb-24" : "")
+      }
+    >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <button
           type="button"
@@ -540,15 +599,21 @@ function FilenameSearch({
       )}
 
       <div className="overflow-hidden rounded-lg border border-line bg-surface">
-        <div className="flex items-center justify-between border-b border-line px-4 py-2.5 text-xs text-ink-soft">
+        {/* The sort sits in the list header rather than in the query row above,
+            because that row is replaced by the snapshot banner and a saved list
+            is worth reordering too. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-line px-4 py-2 text-xs text-ink-soft">
           <span>
             {rows.length.toLocaleString()}{" "}
             {rows.length === 1 ? "result" : "results"}
             {loaded && <span className="text-ink-faint"> as saved</span>}
           </span>
-          <span className="font-mono">
-            {formatSize(rows.reduce((s, h) => s + h.size, 0))} total
-          </span>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <span className="font-mono">
+              {formatSize(rows.reduce((s, h) => s + h.size, 0))} total
+            </span>
+            <SortPicker sort={sort} />
+          </div>
         </div>
         <div ref={parentRef} className="h-[52vh] min-h-[280px] overflow-auto">
           {rows.length === 0 ? (
@@ -574,7 +639,7 @@ function FilenameSearch({
               }}
             >
               {virtual.map((vi) => {
-                const h = rows[vi.index];
+                const h = ordered[vi.index];
                 const isSel = selected.has(h.path);
                 const lost = gone(h.path);
                 return (
@@ -668,31 +733,88 @@ function FilenameSearch({
         </div>
       </div>
 
-      {selected.size > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 px-4 py-3 backdrop-blur md:left-56">
-          <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
-            <span className="text-sm text-ink-soft">
-              <span className="font-semibold text-ink">{selected.size}</span>{" "}
-              {selected.size === 1 ? "file" : "files"} selected
-            </span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
-              >
-                Clear
-              </button>
-              <button
-                type="button"
-                onClick={trashSelected}
-                className="inline-flex items-center gap-2 rounded-md bg-brick px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-              >
-                <IconTrash className="h-4 w-4" />
-                Move {selected.size} to Trash
-              </button>
+      {/* The outcome sits with the button that caused it, above the selection
+          bar, because a skipped file keeps its row ticked and the reader needs
+          both pieces in one place. */}
+      {(outcome || selected.size > 0) && (
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface md:left-56">
+          {outcome && (
+            <div
+              className={
+                "border-b px-4 py-3 " +
+                (outcome.moved.length === 0
+                  ? "border-brick/40 bg-brick-soft"
+                  : outcome.skipped.length > 0
+                    ? "border-ochre/40 bg-ochre-soft"
+                    : "border-teal-line bg-teal-soft")
+              }
+            >
+              <div className="mx-auto max-w-3xl">
+                <div className="flex items-start justify-between gap-3">
+                  <p
+                    className={
+                      "text-sm " +
+                      (outcome.moved.length === 0
+                        ? "text-brick"
+                        : outcome.skipped.length > 0
+                          ? "text-ochre"
+                          : "text-teal")
+                    }
+                  >
+                    {outcome.moved.length === 0
+                      ? `Nothing was moved. ${outcome.skipped.length} ${outcome.skipped.length === 1 ? "file is" : "files are"} still on your disk.`
+                      : outcome.skipped.length > 0
+                        ? `Moved ${outcome.moved.length} ${outcome.moved.length === 1 ? "file" : "files"} to Trash. ${outcome.skipped.length} stayed put and ${outcome.skipped.length === 1 ? "is" : "are"} still selected, so you can try again.`
+                        : `Moved ${outcome.moved.length} ${outcome.moved.length === 1 ? "file" : "files"} to Trash.`}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setOutcome(null)}
+                    className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-ink-soft transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+                {outcome.skipped.length > 0 && (
+                  <ul className="mt-2 max-h-28 space-y-1.5 overflow-auto">
+                    {outcome.skipped.map((s) => (
+                      <li key={s.path} className="text-xs">
+                        <span className="block truncate font-mono text-ink">
+                          {s.path}
+                        </span>
+                        <span className="block text-ink-soft">{s.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </div>
-          </div>
+          )}
+          {selected.size > 0 && (
+            <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+              <span className="text-sm text-ink-soft">
+                <span className="font-semibold text-ink">{selected.size}</span>{" "}
+                {selected.size === 1 ? "file" : "files"} selected
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set())}
+                  className="rounded-md border border-line bg-surface px-3 py-2 text-sm font-medium text-ink hover:border-line-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={trashSelected}
+                  className="inline-flex items-center gap-2 rounded-md bg-brick px-3.5 py-2 text-sm font-medium text-white hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brick focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                >
+                  <IconTrash className="h-4 w-4" />
+                  Move {selected.size} to Trash
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
